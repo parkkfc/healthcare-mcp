@@ -1,0 +1,41 @@
+{
+	"name": "healthcare-mcp",
+	"main": "dist/__entry.js",
+	"compatibility_date": "2026-11-11",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"define": {
+		"process.env.NODE_ENV": "\"production\""
+	},
+	"alias": {
+		"vite": "./src/stubs/worker-dev-modules.js",
+		"@skybridge/devtools": "./src/stubs/worker-dev-modules.js",
+		"@vitejs/devtools/config": "./src/stubs/worker-dev-modules.js"
+	},
+	// npm run dev:worker 와 npm run deploy 가 이 폴더의 SQL을 적용한다.
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "healthcare-mcp",
+			"database_id": "d70d2856-5489-4034-8896-199c3a7053ec",
+			"migrations_dir": "migrations"
+		}
+	],
+	"kv_namespaces": [],
+	"r2_buckets": [
+		{
+			"binding": "IMAGES",
+			"bucket_name": "healthcare-mcp-images"
+		}
+	],
+	// Workers AI 바인딩 제거: 음식 kcal 추정은 호스트 LLM(estimate-food-kcal).
+	// Workers에는 디스크가 없어서 위젯 JS/CSS를 정적으로 연다.
+	// dist/assets/_redirects가 /assets/assets/* 요청을 /assets/* 파일로 되돌린다.
+	"assets": {
+		"directory": "./dist/assets",
+		"html_handling": "none",
+		"not_found_handling": "none",
+		"run_worker_first": ["/mcp", "/mcp/*", "/auth", "/auth/*"]
+	}
+}

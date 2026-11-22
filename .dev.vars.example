@@ -1,0 +1,21 @@
+# Copy to .dev.vars for local wrangler, or set as Cloudflare Worker secrets:
+#   npx wrangler secret put GOOGLE_CLIENT_ID
+#   npx wrangler secret put GOOGLE_CLIENT_SECRET
+#   npx wrangler secret put KAKAO_REST_API_KEY
+#   npx wrangler secret put KAKAO_CLIENT_SECRET
+#   npx wrangler secret put OAUTH_STATE_SECRET
+#   npx wrangler secret put PUBLIC_BASE_URL
+
+PUBLIC_BASE_URL=https://healthcare-mcp.my-first-mcp-server-gus.workers.dev
+OAUTH_STATE_SECRET=replace-with-long-random-string
+
+# Google Cloud Console → OAuth 2.0 Client (Web)
+# Redirect URI: https://healthcare-mcp.my-first-mcp-server-gus.workers.dev/auth/google/callback
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+
+# Kakao Developers → 내 애플리케이션 → 앱 키 / 보안
+# Redirect URI: https://healthcare-mcp.my-first-mcp-server-gus.workers.dev/auth/kakao/callback
+# 카카오 로그인 동의항목에 카카오계정(이메일) 필수/선택 포함
+KAKAO_REST_API_KEY=
+KAKAO_CLIENT_SECRET=

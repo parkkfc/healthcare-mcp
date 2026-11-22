@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env*
+.dev.vars
+.DS_store
+*.tsbuildinfo
+.skybridge/
+.vercel/
+.wrangler/
+.alpic/
+repomix-output.*
+scripts/.tmp-training-docs/
+scripts/seed-training-docs.sql

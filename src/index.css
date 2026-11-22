@@ -1,0 +1,211 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "@alpic-ai/ui/theme";
+
+@source "../node_modules/@alpic-ai/ui/src";
+
+@theme {
+  --font-sans: "Inter", system-ui, sans-serif;
+  --font-mozilla: "Inter", system-ui, sans-serif;
+  --animate-float: float 3s ease-in-out infinite;
+  --animate-twirl: twirl 20s ease-in-out infinite;
+  --animate-aurora: aurora 20s ease-in-out infinite;
+  --animate-gradient-flow: gradient-flow 6s linear infinite;
+}
+
+@keyframes gradient-flow {
+  0% {
+    background-position: 200% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+@keyframes aurora {
+  0%,
+  100% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+}
+
+@keyframes float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-6px);
+  }
+}
+
+@keyframes twirl {
+  0%,
+  80% {
+    transform: rotateY(0deg);
+  }
+  85% {
+    transform: rotateY(180deg);
+  }
+  95% {
+    transform: rotateY(180deg);
+  }
+  100% {
+    transform: rotateY(360deg);
+  }
+}
+
+/* Habit growth tree — stage idle motions (transform/opacity only). */
+.habit-tree-img {
+  transform-origin: 50% 100%;
+  will-change: transform;
+}
+
+@keyframes habit-tree-seed {
+  0%,
+  100% {
+    transform: scale(1) rotate(0deg);
+  }
+  40% {
+    transform: scale(1.04) rotate(-2deg);
+  }
+  70% {
+    transform: scale(1.02) rotate(2deg);
+  }
+}
+
+@keyframes habit-tree-sprout {
+  0%,
+  100% {
+    transform: translateY(0) scale(1);
+  }
+  50% {
+    transform: translateY(-5px) scale(1.03);
+  }
+}
+
+@keyframes habit-tree-sapling {
+  0%,
+  100% {
+    transform: rotate(-2.5deg);
+  }
+  50% {
+    transform: rotate(2.5deg);
+  }
+}
+
+@keyframes habit-tree-young {
+  0%,
+  100% {
+    transform: rotate(-3deg) scale(1);
+  }
+  50% {
+    transform: rotate(3deg) scale(1.02);
+  }
+}
+
+@keyframes habit-tree-lush {
+  0%,
+  100% {
+    transform: rotate(-4deg) translateY(0);
+  }
+  50% {
+    transform: rotate(4deg) translateY(-2px);
+  }
+}
+
+@keyframes habit-tree-bloom {
+  0%,
+  100% {
+    transform: rotate(-3deg) scale(1);
+    filter: brightness(1);
+  }
+  50% {
+    transform: rotate(3deg) scale(1.035);
+    filter: brightness(1.08);
+  }
+}
+
+@keyframes habit-tree-level-up {
+  0% {
+    opacity: 0.35;
+    transform: scale(0.86);
+  }
+  60% {
+    opacity: 1;
+    transform: scale(1.06);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes habit-tree-sparkle {
+  0%,
+  100% {
+    opacity: 0.15;
+    background-position: 0% 40%;
+  }
+  50% {
+    opacity: 0.45;
+    background-position: 100% 60%;
+  }
+}
+
+.habit-tree-seed {
+  animation: habit-tree-seed 2.4s ease-in-out infinite;
+}
+.habit-tree-sprout {
+  animation: habit-tree-sprout 1.8s ease-in-out infinite;
+}
+.habit-tree-sapling {
+  animation: habit-tree-sapling 2.6s ease-in-out infinite;
+}
+.habit-tree-young {
+  animation: habit-tree-young 2.8s ease-in-out infinite;
+}
+.habit-tree-lush {
+  animation: habit-tree-lush 3.2s ease-in-out infinite;
+}
+.habit-tree-bloom {
+  animation: habit-tree-bloom 2.4s ease-in-out infinite;
+}
+.habit-tree-level-up {
+  animation: habit-tree-level-up 0.65s ease-out 1;
+}
+.habit-tree-sparkle {
+  background: radial-gradient(
+      circle at 20% 30%,
+      rgba(255, 215, 120, 0.55),
+      transparent 40%
+    ),
+    radial-gradient(
+      circle at 80% 25%,
+      rgba(255, 160, 200, 0.4),
+      transparent 35%
+    ),
+    radial-gradient(
+      circle at 55% 15%,
+      rgba(255, 255, 255, 0.5),
+      transparent 30%
+    );
+  background-size: 160% 160%;
+  animation: habit-tree-sparkle 2.8s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .habit-tree-seed,
+  .habit-tree-sprout,
+  .habit-tree-sapling,
+  .habit-tree-young,
+  .habit-tree-lush,
+  .habit-tree-bloom,
+  .habit-tree-level-up,
+  .habit-tree-sparkle {
+    animation: none !important;
+  }
+}

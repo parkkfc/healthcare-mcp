@@ -1,0 +1,1 @@
+ALTER TABLE `users` ADD `handful_volume_ml` real;

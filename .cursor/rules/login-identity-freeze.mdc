@@ -1,0 +1,28 @@
+---
+description: Freeze login/identity flow — do not change unless the user explicitly asks to fix login.
+alwaysApply: true
+---
+
+# Login / Identity Freeze
+
+User confirmed (2026-11-16): post-login state and saves work. **Do not modify this flow** unless the user explicitly asks to change login/identity.
+
+## Frozen files (do not edit casually)
+
+- `src/identity.ts`
+- `src/oauth.ts` (alias / OAuth account linking guards)
+- `src/views/use-claim-conversation-key.ts`
+- `src/views/use-account-key.ts`
+- `src/views/login.tsx`
+- `src/views/home.tsx` conversationKey claim / `identityPending` / login panel branches
+- `src/server.ts`: `accountId`, `readyUserId`, `issueConversationKey`, `get-user` / `open-home` / `open-login` / `link-account-key` / login gates and related tool instructions
+- `conversation_keys` schema/migrations; `account_aliases` login linking behavior
+
+## Fixed design
+
+1. Claude has no server subject → `open-home` / `open-login` mint `conversationKey`.
+2. Widget calls `link-account-key` to bind that key to the device logged-in account.
+3. Every tool uses `identify()` only (`ready` | `login` | `pending` | `unknown`).
+4. `open-home` must not tell the model "not logged in"; refuse saves only when not `ready` / when `get-user.loginRequired` is true.
+
+If a task seems to need changes here, stop and ask the user first. See `.cursorrules` §5.2 and `SPEC.md` Home → Identity.

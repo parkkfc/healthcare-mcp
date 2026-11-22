@@ -1,0 +1,16 @@
+INSERT OR IGNORE INTO `exercises` (`slug`, `name_ko`, `kind`, `laterality`, `region`, `isolation`, `cue`) VALUES
+	('glute-bridge', '글루트 브릿지', 'strength', 'bilateral', 'lower', 1, '발바닥으로 밀어 엉덩이를 들어 올리세요.'),
+	('single-leg-bridge', '원레그 브릿지', 'strength', 'unilateral', 'lower', 1, '약한 다리부터. 골반이 기울지 않게.'),
+	('bird-dog', '버드독', 'strength', 'unilateral', 'core', 1, '반대 팔·다리를 천천히 뻗고 허리를 고정하세요.'),
+	('dead-bug', '데드버그', 'strength', 'unilateral', 'core', 1, '허리가 바닥에서 뜨지 않게 유지하세요.'),
+	('goblet-squat', '고블릿 스쿼트', 'strength', 'bilateral', 'lower', 0, '덤벨을 가슴에 붙이고 무릎·발끝 방향을 맞추세요.'),
+	('db-lunge', '덤벨 런지', 'strength', 'unilateral', 'lower', 0, '약한 다리부터. 앞무릎이 발끝 밖으로 나가지 않게.'),
+	('band-row', '밴드 로우', 'strength', 'unilateral', 'upper', 0, '밴드를 고정하고 팔꿈치로 끌어당기세요.'),
+	('band-pull-apart', '밴드 풀어파트', 'strength', 'bilateral', 'upper', 1, '어깨뼈를 모으며 밴드를 좌우로 벌리세요.'),
+	('band-squat', '밴드 스쿼트', 'strength', 'bilateral', 'lower', 0, '밴드 저항을 느끼며 무릎·발끝 방향을 맞추세요.'),
+	('pull-up', '풀업', 'strength', 'bilateral', 'upper', 0, '어깨를 내리고 가슴을 바 쪽으로 끌어올리세요.'),
+	('hanging-knee-raise', '행잉 니 레이즈', 'strength', 'bilateral', 'core', 1, '흔들림을 줄이고 무릎을 들어 올리세요.'),
+	('bulgarian-split', '불가리안 스플릿 스쿼트', 'strength', 'unilateral', 'lower', 0, '뒷발을 벤치에 올리고 약한 다리부터.'),
+	('hip-thrust', '힙 쓰러스트', 'strength', 'bilateral', 'lower', 0, '어깨를 벤치에 기대고 엉덩이를 밀어 올리세요.'),
+	('kb-swing', '케틀벨 스윙', 'strength', 'bilateral', 'full', 0, '엉덩이 힘으로 케틀벨을 앞으로 밀어 올리세요.'),
+	('kb-goblet-squat', '케틀벨 고블릿 스쿼트', 'strength', 'bilateral', 'lower', 0, '케틀벨을 가슴에 붙이고 앉았다 일어서세요.');

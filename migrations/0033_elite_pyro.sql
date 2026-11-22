@@ -1,0 +1,1 @@
+ALTER TABLE `users` ADD `target_started_on` text;
