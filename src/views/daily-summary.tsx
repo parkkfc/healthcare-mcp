@@ -9,6 +9,7 @@ import {
 import { useUser } from "skybridge/web";
 import { useToolInfo } from "@/helpers.js";
 import { AffiliateCarousel } from "./components/affiliate-carousel.js";
+import { ChatNextHint } from "./components/chat-next-hint.js";
 import { SourceFooter } from "./components/source-footer.js";
 
 export type DailySummaryData = Extract<
@@ -128,6 +129,7 @@ export function DailySummaryPanel({
         }
         libs={["recharts"]}
       />
+      <ChatNextHint example="탄단지 차트 보여줘" />
       <div
         className="hidden"
         data-llm={JSON.stringify({

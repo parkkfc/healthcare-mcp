@@ -10,7 +10,7 @@ import {
   type TargetBodyType,
 } from "@/body-goals.js";
 import { useCallTool, useToolInfo } from "@/helpers.js";
-import { bumpProfile } from "./profile-sync.js";
+import { bumpProfile } from "../hooks/profile-sync.js";
 import maleSlim from "@/widgets/1.남자슬림.png";
 import femaleSlim from "@/widgets/1.여자슬림.png";
 import maleHypertrophy from "@/widgets/2.남자근비대.png";
@@ -22,6 +22,7 @@ import femaleUpper from "@/widgets/4.여자상체집중형.png";
 import maleLower from "@/widgets/5.남자하체집중형.png";
 import femaleLower from "@/widgets/5.여자하체집중형.png";
 import { deviceToday, deviceTimeZone } from "@/device-time.js";
+import { ChatNextHint } from "./components/chat-next-hint.js";
 import { useAccountKey } from "./use-account-key.js";
 
 type PhotoSex = "male" | "female";
@@ -420,6 +421,9 @@ export function ChooseBodyGoalPanel({
       )}
 
       {notice ? <p className="text-sm">{notice}</p> : null}
+      {saved || mode === "summary" ? (
+        <ChatNextHint example="오늘 맞춤 운동 짜줘" />
+      ) : null}
       <div
         className="hidden"
         data-llm={JSON.stringify({

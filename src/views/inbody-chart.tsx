@@ -38,9 +38,9 @@ import { cidShape, type Sex, shapeNote } from "@/cid.js";
 import { useCallTool, useToolInfo } from "@/helpers.js";
 import { AffiliateCarousel } from "./components/affiliate-carousel.js";
 import { SourceFooter } from "./components/source-footer.js";
-import { bumpProfile } from "./profile-sync.js";
+import { bumpProfile } from "../hooks/profile-sync.js";
 import { useAccountKey } from "./use-account-key.js";
-import { useAssistantContext } from "./use-assistant-context.js";
+import { useAssistantContext } from "../hooks/use-assistant-context.js";
 
 const visuals = ["bar", "line", "area"] as const;
 const visualLabel = { bar: "막대", line: "꺾은선", area: "영역" } as const;

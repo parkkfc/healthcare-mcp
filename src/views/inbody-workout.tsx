@@ -53,8 +53,69 @@ import {
   dateInSameWeek,
   sessionKindLabel,
 } from "@/workout-schedule.js";
+import {
+  asRestWeekDay,
+  cloneWeekPlan,
+  weekPlanDirtyKey,
+  type WeekPlanDay,
+  type WeekPlanPayload,
+} from "@/workout-week-plan.js";
+
+type ParkedCoursePayload = Pick<
+  WeekPlanDay,
+  | "kind"
+  | "templateKind"
+  | "sessionLabel"
+  | "sessionKind"
+  | "sessionFocus"
+  | "recommendedMode"
+  | "recommendedIntensity"
+  | "prescription"
+  | "safetyNotes"
+  | "missingSlots"
+  | "exercises"
+  | "energy"
+>;
+
+type ParkedCourse = {
+  id: string;
+  fromDate: string;
+  label: string;
+  payload: ParkedCoursePayload;
+};
+
+function parkLabelForDay(day: WeekPlanDay): string {
+  const part =
+    day.sessionLabel?.trim() ||
+    sessionKindLabel[day.templateKind] ||
+    "운동";
+  return `${part}/${day.date}`;
+}
+
+function applyParkedPayload(
+  day: WeekPlanDay,
+  payload: ParkedCoursePayload,
+): WeekPlanDay {
+  return {
+    ...day,
+    mark: "O",
+    kind: payload.kind === "rest" ? day.templateKind : payload.kind,
+    templateKind: payload.templateKind,
+    sessionLabel: payload.sessionLabel,
+    sessionKind: payload.sessionKind,
+    sessionFocus: payload.sessionFocus,
+    recommendedMode: payload.recommendedMode,
+    recommendedIntensity: payload.recommendedIntensity,
+    prescription: payload.prescription,
+    safetyNotes: payload.safetyNotes,
+    missingSlots: payload.missingSlots,
+    exercises: payload.exercises,
+    energy: payload.energy,
+  };
+}
 import { useCallTool, useToolInfo } from "@/helpers.js";
 import { deviceToday } from "@/device-time.js";
+import { ChatNextHint } from "./components/chat-next-hint.js";
 import { TermTip, withTermTips } from "./components/term-tip.js";
 import { useAccountKey } from "./use-account-key.js";
 
@@ -75,7 +136,7 @@ export type InbodyWorkoutData = Extract<
   { isSuccess: true }
 >["output"];
 
-type Exercise = InbodyWorkoutData["exercises"][number];
+type Exercise = NonNullable<InbodyWorkoutData["exercises"]>[number];
 
 const modeMeta: Record<
   WorkoutTimerMode,
@@ -502,7 +563,7 @@ function AnatomyBlock({
     }
   } else {
     const targetSet = new Set(
-      radar
+      (radar ?? [])
         .filter((row) => targetLabels.includes(row.region))
         .map((row) => row.region),
     );
@@ -533,13 +594,15 @@ function AnatomyBlock({
     mode === "exercise" && exercise
       ? `${exercise.nameKo} 운동 부위`
       : mode === "day"
-        ? dayTitle || "오늘 운동 부위"
+        ? dayTitle || "선택일 운동 부위"
         : "현재 내몸상태";
   const radarTitle =
     mode === "exercise" && exercise
       ? `${exercise.nameKo} 자극 부위`
       : mode === "day"
-        ? "오늘 자극 부위"
+        ? dayTitle
+          ? `${dayTitle} 자극`
+          : "선택일 자극 부위"
         : "부위 밸런스";
   const yellowLabel =
     mode === "exercise" || mode === "day"
@@ -687,6 +750,9 @@ export function InbodyWorkoutPanel({
   const [, setDisplayMode] = useDisplayMode();
   const { callToolAsync: saveSession, isPending: saving } =
     useCallTool("save-workout-log");
+  const { callToolAsync: saveWeekPlan, isPending: savingWeek } = useCallTool(
+    "save-workout-week-plan",
+  );
 
   const [venue, setVenue] = useState<TrainingVenue>(
     data.trainingVenue === "home" ? "home" : "gym",
@@ -708,9 +774,6 @@ export function InbodyWorkoutPanel({
     ).getDay();
   }, [baseDate]);
   const [selectedWeekday, setSelectedWeekday] = useState(todayWeekday);
-  const [weekMarkOverrides, setWeekMarkOverrides] = useState<
-    Partial<Record<number, "O" | "X">>
-  >({});
   const planDate = useMemo(
     () => dateInSameWeek(baseDate, selectedWeekday),
     [baseDate, selectedWeekday],
@@ -723,19 +786,51 @@ export function InbodyWorkoutPanel({
     Boolean(savedWeek) &&
     savedWeek!.venue === venue &&
     (venue !== "home" || savedGearKey === liveGearKey);
+  const canEditWeek = weekPlanMatches && Boolean(savedWeek);
 
-  const savedDay = useMemo(() => {
-    if (!weekPlanMatches || !savedWeek) return null;
-    return (
-      savedWeek.days.find((day) => day.date === planDate) ??
-      savedWeek.days.find((day) => day.weekday === selectedWeekday) ??
-      null
-    );
-  }, [weekPlanMatches, savedWeek, planDate, selectedWeekday]);
+  const [draftWeek, setDraftWeek] = useState<WeekPlanPayload | null>(() => {
+    const initial = data.weekPlan as WeekPlanPayload | null | undefined;
+    if (!initial) return null;
+    const initialVenue = data.trainingVenue === "home" ? "home" : "gym";
+    if (initial.venue !== initialVenue) return null;
+    return cloneWeekPlan(initial);
+  });
+  const [draftBaselineKey, setDraftBaselineKey] = useState(() => {
+    const initial = data.weekPlan as WeekPlanPayload | null | undefined;
+    if (!initial) return "";
+    const initialVenue = data.trainingVenue === "home" ? "home" : "gym";
+    if (initial.venue !== initialVenue) return "";
+    return weekPlanDirtyKey(initial);
+  });
+  const [weekSaveNotice, setWeekSaveNotice] = useState("");
+  const [parkedCourses, setParkedCourses] = useState<ParkedCourse[]>([]);
+  const draftSourceKeyRef = useRef(
+    savedWeek
+      ? `${savedWeek.weekStart}|${savedWeek.venue}|${(savedWeek.homeEquipment ?? []).slice().sort().join(",")}|${savedWeek.fingerprint}|${weekPlanDirtyKey(savedWeek)}`
+      : "",
+  );
+
+  useEffect(() => {
+    if (!canEditWeek || !savedWeek) {
+      if (draftSourceKeyRef.current !== "") {
+        draftSourceKeyRef.current = "";
+        setDraftWeek(null);
+        setDraftBaselineKey("");
+        setParkedCourses([]);
+      }
+      return;
+    }
+    const sourceKey = `${savedWeek.weekStart}|${venue}|${liveGearKey}|${savedWeek.fingerprint}|${weekPlanDirtyKey(savedWeek)}`;
+    if (draftSourceKeyRef.current === sourceKey) return;
+    draftSourceKeyRef.current = sourceKey;
+    const cloned = cloneWeekPlan(savedWeek);
+    setDraftWeek(cloned);
+    setDraftBaselineKey(weekPlanDirtyKey(cloned));
+    setParkedCourses([]);
+  }, [canEditWeek, savedWeek, venue, liveGearKey]);
 
   const live = useMemo(() => {
-    // Prefer the Mon–Sun plan already saved on the server for this venue.
-    if (weekPlanMatches) return null;
+    if (canEditWeek && draftWeek) return null;
     if (!data.snapshot || !data.catalog?.length) return null;
     return analyzeInbodyWorkout(data.snapshot, data.catalog, {
       targetBodyType: (data.targetBodyType || null) as TargetBodyType | null,
@@ -748,7 +843,8 @@ export function InbodyWorkoutPanel({
       targetDays: data.targetDays ?? null,
     });
   }, [
-    weekPlanMatches,
+    canEditWeek,
+    draftWeek,
     data.snapshot,
     data.catalog,
     data.targetBodyType,
@@ -761,15 +857,23 @@ export function InbodyWorkoutPanel({
     homeGear,
   ]);
 
+  const draftDay = useMemo(() => {
+    if (!draftWeek) return null;
+    return (
+      draftWeek.days.find((day) => day.date === planDate) ??
+      draftWeek.days.find((day) => day.weekday === selectedWeekday) ??
+      null
+    );
+  }, [draftWeek, planDate, selectedWeekday]);
+
   const weekDays = useMemo(() => {
-    if (weekPlanMatches && savedWeek) {
-      return savedWeek.days.map((day) => {
-        const mark = weekMarkOverrides[day.weekday] ?? day.mark;
-        const on = mark === "O";
+    if (canEditWeek && draftWeek) {
+      return draftWeek.days.map((day) => {
+        const on = day.mark === "O";
         return {
           weekday: day.weekday,
           dayLabel: day.dayLabel,
-          mark,
+          mark: day.mark,
           kind: on ? day.templateKind : ("rest" as const),
           templateKind: day.templateKind,
           sessionLabel: on
@@ -783,11 +887,10 @@ export function InbodyWorkoutPanel({
       bias: live?.scheduleBias ?? data.scheduleBias ?? "balanced",
     });
     return base.map((day) => {
-      const mark = weekMarkOverrides[day.weekday] ?? day.mark;
-      const on = mark === "O";
+      const on = day.mark === "O";
       return {
         ...day,
-        mark,
+        mark: day.mark,
         kind: on ? day.templateKind : ("rest" as const),
         sessionLabel: on
           ? sessionKindLabel[day.templateKind]
@@ -795,9 +898,8 @@ export function InbodyWorkoutPanel({
       };
     });
   }, [
-    weekPlanMatches,
-    savedWeek,
-    weekMarkOverrides,
+    canEditWeek,
+    draftWeek,
     live?.phase,
     live?.scheduleBias,
     data.phase,
@@ -805,85 +907,191 @@ export function InbodyWorkoutPanel({
   ]);
   const selectedSlot =
     weekDays.find((day) => day.weekday === selectedWeekday) ?? weekDays[0];
-  const isRestDay = selectedSlot?.mark === "X";
+  /** Rest/training for UI must follow draftDay (selected date), not a stale slot. */
+  const isRestDay = canEditWeek
+    ? (draftDay?.mark ?? selectedSlot?.mark) === "X"
+    : selectedSlot?.mark === "X";
+  const weekDirty =
+    Boolean(draftWeek) &&
+    draftBaselineKey !== "" &&
+    weekPlanDirtyKey(draftWeek!) !== draftBaselineKey;
+  const canParkSelected =
+    canEditWeek &&
+    Boolean(draftDay) &&
+    draftDay!.mark === "O" &&
+    (draftDay!.exercises?.length ?? 0) > 0;
+  const canApplyParked =
+    canEditWeek &&
+    Boolean(draftDay) &&
+    draftDay!.mark === "X" &&
+    parkedCourses.length > 0;
 
-  const planExercises = isRestDay
-    ? []
-    : weekPlanMatches && savedDay
-      ? savedDay.exercises
-      : (live?.exercises ?? data.exercises);
-  const planMode =
-    (weekPlanMatches && savedDay
-      ? savedDay.recommendedMode
-      : live?.recommendedMode) ?? data.recommendedMode;
+  const planExercises = (
+    isRestDay
+      ? []
+      : canEditWeek && draftDay
+        ? draftDay.exercises
+        : (live?.exercises ?? data.exercises)
+  ) ?? [];
+  const planMode: WorkoutTimerMode =
+    (canEditWeek && draftDay
+      ? draftDay.recommendedMode
+      : live?.recommendedMode) ??
+    data.recommendedMode ??
+    "rest_timer";
   const planIntensity =
-    (weekPlanMatches && savedDay
-      ? savedDay.recommendedIntensity
+    (canEditWeek && draftDay
+      ? draftDay.recommendedIntensity
       : live?.recommendedIntensity) ??
     data.recommendedIntensity ??
     1;
   const planPrescription =
-    (weekPlanMatches && savedDay
-      ? savedDay.prescription
+    (canEditWeek && draftDay
+      ? draftDay.prescription
       : live?.prescription) ?? data.prescription;
   const planSafety = (
-    (weekPlanMatches && savedDay
-      ? savedDay.safetyNotes
+    (canEditWeek && draftDay
+      ? draftDay.safetyNotes
       : live?.safetyNotes) ??
     data.safetyNotes ??
     []
   ).filter((note) => !/DB|데이터베이스|missingSlots/i.test(note));
   const planTargetBody =
-    (weekPlanMatches ? savedWeek?.targetBodyLabel : live?.targetBodyLabel) ??
-    data.targetBodyLabel;
+    (canEditWeek && draftWeek
+      ? draftWeek.targetBodyLabel
+      : live?.targetBodyLabel) ??
+    data.targetBodyLabel ??
+    "";
   const planWeak =
-    (weekPlanMatches ? savedWeek?.weakLabels : live?.weakLabels) ??
-    data.weakLabels;
+    (canEditWeek && draftWeek ? draftWeek.weakLabels : live?.weakLabels) ??
+    data.weakLabels ??
+    [];
   const planTargets =
-    (weekPlanMatches ? savedWeek?.targetLabels : live?.targetLabels) ??
-    data.targetLabels;
+    (canEditWeek && draftWeek ? draftWeek.targetLabels : live?.targetLabels) ??
+    data.targetLabels ??
+    [];
   const sessionLabel =
-    (weekPlanMatches && savedDay
-      ? savedDay.sessionLabel
+    (canEditWeek && draftDay
+      ? draftDay.sessionLabel
       : live?.sessionLabel) ||
     data.sessionLabel ||
-    "오늘 코스";
+    "선택일 코스";
   const planEnergy =
-    (weekPlanMatches && savedDay ? savedDay.energy : live?.energy) ??
-    data.energy;
-  const planPhase = (weekPlanMatches
-    ? savedWeek?.phase
+    (canEditWeek && draftDay ? draftDay.energy : live?.energy) ?? data.energy;
+  const planPhase = (canEditWeek && draftWeek
+    ? draftWeek.phase
     : live?.phase ?? data.phase ?? 2) as 1 | 2 | 3;
   const planPhaseLabel =
-    (weekPlanMatches ? savedWeek?.phaseLabel : live?.phaseLabel) ??
+    (canEditWeek && draftWeek
+      ? draftWeek.phaseLabel
+      : live?.phaseLabel) ??
     data.phaseLabel ??
     phaseLabel[planPhase];
   const planBias =
-    (weekPlanMatches ? savedWeek?.scheduleBias : live?.scheduleBias) ??
+    (canEditWeek && draftWeek
+      ? draftWeek.scheduleBias
+      : live?.scheduleBias) ??
     data.scheduleBias ??
     "balanced";
   const planShape = String(
-    (weekPlanMatches ? savedWeek?.shape : live?.shape) ?? data.shape ?? "I",
+    (canEditWeek && draftWeek ? draftWeek.shape : live?.shape) ??
+      data.shape ??
+      "I",
   );
   const planImbalanced = Boolean(
-    (weekPlanMatches ? savedWeek?.isImbalanced : live?.isImbalanced) ??
+    (canEditWeek && draftWeek
+      ? draftWeek.isImbalanced
+      : live?.isImbalanced) ??
       data.isImbalanced ??
       false,
   );
   const planInjured = (data.injuredParts ?? []) as string[];
   const planStructural = (
-    (weekPlanMatches
-      ? savedWeek?.structuralIssues
+    (canEditWeek && draftWeek
+      ? draftWeek.structuralIssues
       : live?.structuralIssues) ??
     data.structuralIssues ??
     []
   ).map((issue) => issue.title);
 
   function setSelectedDayMark(mark: "O" | "X") {
-    setWeekMarkOverrides((prev) => ({
-      ...prev,
-      [selectedWeekday]: mark,
-    }));
+    if (!canEditWeek || !draftWeek) {
+      setNotice("저장된 이번 주 코스가 있을 때만 요일을 바꿀 수 있습니다.");
+      return;
+    }
+    const idx = draftWeek.days.findIndex(
+      (day) => day.date === planDate || day.weekday === selectedWeekday,
+    );
+    if (idx < 0) return;
+    const current = draftWeek.days[idx]!;
+
+    if (mark === "X") {
+      if (current.mark !== "O" || (current.exercises?.length ?? 0) === 0) {
+        setNotice("옮길 운동 종목이 있는 날만 휴식으로 바꿀 수 있습니다.");
+        return;
+      }
+      const parked: ParkedCourse = {
+        id: `${current.date}-${Date.now()}`,
+        fromDate: current.date,
+        label: parkLabelForDay(current),
+        payload: {
+          kind: current.kind,
+          templateKind: current.templateKind,
+          sessionLabel: current.sessionLabel,
+          sessionKind: current.sessionKind,
+          sessionFocus: current.sessionFocus,
+          recommendedMode: current.recommendedMode,
+          recommendedIntensity: current.recommendedIntensity,
+          prescription: current.prescription,
+          safetyNotes: current.safetyNotes,
+          missingSlots: current.missingSlots,
+          exercises: current.exercises,
+          energy: current.energy,
+        },
+      };
+      setParkedCourses((prev) => [...prev, parked]);
+      setDraftWeek((prev) => {
+        if (!prev) return prev;
+        const next = cloneWeekPlan(prev);
+        const dayIdx = next.days.findIndex(
+          (day) => day.date === planDate || day.weekday === selectedWeekday,
+        );
+        if (dayIdx < 0) return prev;
+        next.days[dayIdx] = asRestWeekDay(next.days[dayIdx]!);
+        return next;
+      });
+      setNotice(
+        `${selectedSlot?.dayLabel ?? ""}요일 코스를 대기 목록에 넣었습니다(${parked.label}). 저장하기를 눌러 DB에 반영하세요.`,
+      );
+    } else {
+      if (current.mark !== "X") {
+        setNotice("휴식(X)인 날에만 대기 코스를 입힐 수 있습니다.");
+        return;
+      }
+      if (parkedCourses.length === 0) {
+        setNotice(
+          "대기 코스가 없습니다. 먼저 운동일을 휴식으로 바꿔 목록에 넣으세요.",
+        );
+        return;
+      }
+      const [top, ...rest] = parkedCourses;
+      if (!top) return;
+      setParkedCourses(rest);
+      setDraftWeek((prev) => {
+        if (!prev) return prev;
+        const next = cloneWeekPlan(prev);
+        const dayIdx = next.days.findIndex(
+          (day) => day.date === planDate || day.weekday === selectedWeekday,
+        );
+        if (dayIdx < 0) return prev;
+        next.days[dayIdx] = applyParkedPayload(next.days[dayIdx]!, top.payload);
+        return next;
+      });
+      setNotice(
+        `${selectedSlot?.dayLabel ?? ""}요일에 ${top.label} 코스를 입혔습니다. 저장하기를 눌러 DB에 반영하세요.`,
+      );
+    }
+
     setActiveIndex(0);
     setAnatomyView(mark === "O" ? "day" : "body");
     setTimerReady(false);
@@ -894,11 +1102,58 @@ export function InbodyWorkoutPanel({
     setSetsDone(0);
     setRounds(0);
     setRestLeft(0);
-    setNotice(
-      mark === "O"
-        ? `${selectedSlot?.dayLabel ?? ""}요일을 운동하는 날(O)로 바꿨습니다.`
-        : `${selectedSlot?.dayLabel ?? ""}요일을 쉬는 날(X)로 바꿨습니다.`,
+    setWeekSaveNotice("");
+  }
+
+  async function persistWeekPlan() {
+    if (!draftWeek || !weekDirty) return;
+    const emptyO = draftWeek.days.find(
+      (day) => day.mark === "O" && (day.exercises?.length ?? 0) === 0,
     );
+    if (emptyO) {
+      setNotice(
+        `${emptyO.dayLabel}요일은 운동(O)인데 종목이 없습니다. 대기 목록에서 입히거나 휴식으로 두세요.`,
+      );
+      return;
+    }
+    const leftoverPark = parkedCourses.length;
+    try {
+      const result = await saveWeekPlan({
+        trainingVenue: venue,
+        homeEquipment: venue === "home" ? homeGear : undefined,
+        clientDate: baseDate,
+        clientTimeZone:
+          typeof Intl !== "undefined"
+            ? Intl.DateTimeFormat().resolvedOptions().timeZone
+            : undefined,
+        plan: draftWeek,
+        accountKey,
+      });
+      const ok = result.structuredContent?.ok !== false;
+      if (!ok) {
+        setNotice(
+          result.structuredContent?.message ??
+            "이번 주 코스를 저장하지 못했습니다.",
+        );
+        return;
+      }
+      const key = weekPlanDirtyKey(draftWeek);
+      setDraftBaselineKey(key);
+      draftSourceKeyRef.current = `${draftWeek.weekStart}|${venue}|${liveGearKey}|${draftWeek.fingerprint}|${key}`;
+      setParkedCourses([]);
+      const discardNote =
+        leftoverPark > 0
+          ? ` 미배치 대기 코스 ${leftoverPark}개는 버렸습니다.`
+          : "";
+      setWeekSaveNotice(`이번 주 코스를 저장했습니다.${discardNote}`);
+      setNotice(`이번 주 코스를 저장했습니다.${discardNote}`);
+    } catch (error) {
+      setNotice(
+        error instanceof Error && error.message
+          ? error.message
+          : "이번 주 코스를 저장하지 못했습니다.",
+      );
+    }
   }
 
   const whyLines = useMemo(
@@ -954,8 +1209,8 @@ export function InbodyWorkoutPanel({
   const [running, setRunning] = useState(false);
   const [elapsedSec, setElapsedSec] = useState(0);
   const [restLeft, setRestLeft] = useState(0);
-  const [roundLeft, setRoundLeft] = useState(data.timer.roundSec || 60);
-  const [limitLeft, setLimitLeft] = useState(data.timer.limitSec);
+  const [roundLeft, setRoundLeft] = useState(data.timer?.roundSec || 60);
+  const [limitLeft, setLimitLeft] = useState(data.timer?.limitSec ?? 0);
   const [setsDone, setSetsDone] = useState(0);
   const [rounds, setRounds] = useState(0);
   const [activeIndex, setActiveIndex] = useState(0);
@@ -995,6 +1250,15 @@ export function InbodyWorkoutPanel({
         planExercises.map((item) => [item.slug, item.reps || 10]),
       ),
   );
+  const [workingRestSec, setWorkingRestSec] = useState<Record<string, number>>(
+    () =>
+      Object.fromEntries(
+        planExercises.map((item) => [
+          item.slug,
+          item.restSec && item.restSec > 0 ? item.restSec : 75,
+        ]),
+      ),
+  );
   const [e1RmBySlug, setE1RmBySlug] = useState<Record<string, number>>(() =>
     Object.fromEntries(
       planExercises.map((item) => [
@@ -1014,7 +1278,7 @@ export function InbodyWorkoutPanel({
   const [sessionActive, setSessionActive] = useState(false);
   const tickRef = useRef<number | null>(null);
   const anatomyRef = useRef<HTMLDivElement | null>(null);
-  const planSyncKey = `${planDate}|${isRestDay ? "X" : "O"}|${venue}:${homeGear.join(",")}|${planExercises.map((item) => item.slug).join(",")}`;
+  const planSyncKey = `${planDate}|${isRestDay ? "X" : "O"}|${sessionLabel}|${venue}:${homeGear.join(",")}|${planExercises.map((item) => item.slug).join(",")}`;
   const planSyncKeyRef = useRef(planSyncKey);
 
   useEffect(() => {
@@ -1035,6 +1299,14 @@ export function InbodyWorkoutPanel({
     setWorkingReps(
       Object.fromEntries(
         planExercises.map((item) => [item.slug, item.reps || 10]),
+      ),
+    );
+    setWorkingRestSec(
+      Object.fromEntries(
+        planExercises.map((item) => [
+          item.slug,
+          item.restSec && item.restSec > 0 ? item.restSec : 75,
+        ]),
       ),
     );
     setE1RmBySlug((prevMap) => {
@@ -1084,6 +1356,7 @@ export function InbodyWorkoutPanel({
     planMode,
     planIntensity,
     planExercises,
+    sessionLabel,
     venue,
     homeGear,
     selectedSlot?.dayLabel,
@@ -1292,7 +1565,15 @@ export function InbodyWorkoutPanel({
 
   function completeSet() {
     setSetsDone((value) => value + 1);
-    if (mode === "rest_timer") setRestLeft(timer.restSec || 75);
+    if (mode === "rest_timer") {
+      const active = planExercises[activeIndex];
+      const perExercise =
+        (active && workingRestSec[active.slug]) ||
+        active?.restSec ||
+        timer.restSec ||
+        75;
+      setRestLeft(Math.max(15, Math.min(300, Math.round(perExercise))));
+    }
   }
 
   async function finishAndSave() {
@@ -1316,7 +1597,7 @@ export function InbodyWorkoutPanel({
     }));
     try {
       const result = await saveSession({
-        date: data.date,
+        date: data.date || baseDate,
         mode,
         recommendedMode: planMode,
         overridden: overrideConfirmed && mode !== planMode,
@@ -1349,9 +1630,12 @@ export function InbodyWorkoutPanel({
           ? limitLeft
           : elapsedSec;
 
+  const activeExercise = planExercises[activeIndex];
   const mainLabel =
     mode === "rest_timer" && restLeft > 0
-      ? "휴식"
+      ? activeExercise
+        ? `${activeExercise.nameKo} 휴식`
+        : "휴식"
       : mode === "emom"
         ? "이번 분"
         : mode === "amrap"
@@ -1538,7 +1822,7 @@ export function InbodyWorkoutPanel({
 
       <div className="rounded-lg border border-border bg-card px-3 py-2 text-sm">
         <p className="mb-2 text-xs font-bold text-muted-foreground">
-          설명 · Phase로 코스를 나누는 이유
+          설명 · 지금 내 몸 상태 Phase
         </p>
         <p className="mb-2 text-xs leading-snug text-muted-foreground">
           지금 적용:{" "}
@@ -1555,103 +1839,89 @@ export function InbodyWorkoutPanel({
             </>
           ) : null}
         </p>
-        <div className="space-y-2.5 text-xs leading-snug">
-          <div
-            className={`rounded-md border px-2.5 py-2 ${
-              planPhase === 1
-                ? "border-blue-500/50 bg-blue-500/10"
-                : "border-border/60"
-            }`}
-          >
-            <p className="font-bold">Phase 1 · 불균형 교정 및 기초 체력</p>
-            <p className="mt-1.5 text-muted-foreground">
-              상·하체 좌우 근육량 차이가 5%(또는 0.2~0.3kg) 이상인 비대칭(
-              <span className="font-semibold text-foreground">
-                isImbalanced: true
-              </span>
-              ) 상태이거나, 기초 근력이 현저히 부족할 때 최우선으로 배정됩니다.
-            </p>
-            <p className="mt-1.5 text-muted-foreground">
-              강한 쪽 사지가 부하를 대신 드는 보상 작용을 막기 위해 바벨 같은
-              양측성 운동을 배제하고, 덤벨·케이블·스플릿 스쿼트 등의{" "}
-              <TermTip term="unilateral">편측성</TermTip> 운동이나 기초 맨몸{" "}
-              <TermTip term="compound">다관절</TermTip> 운동을 수행합니다.
-            </p>
-            <p className="mt-1.5 text-muted-foreground">
-              시간 압박 인터벌(
-              <TermTip term="amrap">AMRAP</TermTip>·
-              <TermTip term="emom">EMOM</TermTip>
-              )은 금지되며, 약한 쪽부터 시작해 강한 쪽도 같은 횟수로 통제할 수
-              있도록{" "}
-              <TermTip term="rest_timer">
-                세트별 휴식 타이머(rest_timer, 60~120초)
-              </TermTip>
-              가 강제됩니다.
-            </p>
-            <p className="mt-1.5 text-muted-foreground">
-              관절 스트레스 없이 동작 제어 능력을 기르기 위해{" "}
-              <TermTip term="pct_1rm">40~60% 1RM</TermTip>의 저~중강도로 세트당
-              12~15회 이상 수행하는 것이 기본 기준입니다.
-            </p>
-          </div>
-          <div
-            className={`rounded-md border px-2.5 py-2 ${
-              planPhase === 2
-                ? "border-blue-500/50 bg-blue-500/10"
-                : "border-border/60"
-            }`}
-          >
-            <p className="font-bold">Phase 2 · 체성분 베이스캠프 구축</p>
-            <p className="mt-1.5 text-muted-foreground">
-              좌우 균형은 잡혀 있지만, 사용자가 선택한 워너비 체형의 체지방률이나
-              골격근량과 현재 인바디 수치 사이에 격차가 클 때 진입합니다.
-            </p>
-            <p className="mt-1.5 text-muted-foreground">
-              체지방 감량이 우선인{" "}
-              <span className="font-semibold text-foreground">C자형</span>{" "}
-              사용자는{" "}
-              <TermTip term="compound">다관절 복합(MJ)</TermTip> 전용 루틴과{" "}
-              <TermTip term="amrap">AMRAP</TermTip> 또는{" "}
-              <TermTip term="emom">EMOM</TermTip> 모드를 통해 1시간 초과 운동 시
-              발생하는 중도 탈락률(~30%)을 예방하고, 운동 후 22시간 안정시
-              대사량(+23.7%)을 극대화합니다.
-            </p>
-            <p className="mt-1.5 text-muted-foreground">
-              체중·근육 증량이 우선인 저체중 사용자는 대근육 위주의 복합 중량
-              운동과{" "}
-              <TermTip term="rest_timer">rest_timer</TermTip> 모드로 전체
-              골격근량 베이스를 끌어올립니다.
-            </p>
-          </div>
-          <div
-            className={`rounded-md border px-2.5 py-2 ${
-              planPhase === 3
-                ? "border-blue-500/50 bg-blue-500/10"
-                : "border-border/60"
-            }`}
-          >
-            <p className="font-bold">Phase 3 · 워너비 체형 디테일 조각</p>
-            <p className="mt-1.5 text-muted-foreground">
-              기초 체성분과 근력 베이스가 일정 궤도에 도달하면 해금되는 최종
-              단계입니다.
-            </p>
-            <p className="mt-1.5 text-muted-foreground">
-              사용자가 고른 워너비 체형의 핵심 타겟 부위(예: 역삼각형 어깨·광배근,
-              애플힙·코어)와 인바디 5대 부위 중 상대적 취약 부위(
-              <span className="font-semibold text-foreground">weakParts</span>
-              )를 결합한{" "}
-              <TermTip term="isolation">단일관절 고립(Isolation, SJ)</TermTip>{" "}
-              분할 루틴을 집중적으로 배정합니다.
-            </p>
-            <p className="mt-1.5 text-muted-foreground">
-              체형 조형·근비대 목적이라면{" "}
-              <TermTip term="pct_1rm">60~80% 1RM</TermTip>
-              (8~12회, 휴식 60~180초)을, 고밀도 파워형 스트렝스 목적이라면{" "}
-              <TermTip term="pct_1rm">80~100% 1RM</TermTip>
-              (1~5회, 휴식 180~300초)을 중심으로{" "}
-              <TermTip term="rest_timer">rest_timer</TermTip>를 활용해 정밀하게
-              훈련합니다.
-            </p>
+        <div className="text-xs leading-snug">
+          <div className="rounded-md border border-blue-500/50 bg-blue-500/10 px-2.5 py-2">
+            {planPhase === 1 ? (
+              <>
+                <p className="font-bold">Phase 1 · 불균형 교정 및 기초 체력</p>
+                <p className="mt-1.5 text-muted-foreground">
+                  상·하체 좌우 근육량 차이가 5%(또는 0.2~0.3kg) 이상인 비대칭
+                  상태이거나, 기초 근력이 현저히 부족해 지금 이 Phase에
+                  배정됐습니다.
+                </p>
+                <p className="mt-1.5 text-muted-foreground">
+                  강한 쪽 사지가 부하를 대신 드는 보상 작용을 막기 위해 바벨
+                  같은 양측성 운동을 배제하고, 덤벨·케이블·스플릿 스쿼트 등의{" "}
+                  <TermTip term="unilateral">편측성</TermTip> 운동이나 기초
+                  맨몸 <TermTip term="compound">다관절</TermTip> 운동을
+                  수행합니다.
+                </p>
+                <p className="mt-1.5 text-muted-foreground">
+                  시간 압박 인터벌(
+                  <TermTip term="amrap">AMRAP</TermTip>·
+                  <TermTip term="emom">EMOM</TermTip>
+                  )은 금지되며, 약한 쪽부터 시작해 강한 쪽도 같은 횟수로 통제할
+                  수 있도록{" "}
+                  <TermTip term="rest_timer">
+                    세트별 휴식 타이머(rest_timer, 60~120초)
+                  </TermTip>
+                  가 강제됩니다.
+                </p>
+                <p className="mt-1.5 text-muted-foreground">
+                  관절 스트레스 없이 동작 제어 능력을 기르기 위해{" "}
+                  <TermTip term="pct_1rm">40~60% 1RM</TermTip>의 저~중강도로
+                  세트당 12~15회 이상 수행하는 것이 기본 기준입니다.
+                </p>
+              </>
+            ) : planPhase === 2 ? (
+              <>
+                <p className="font-bold">Phase 2 · 체성분 베이스캠프 구축</p>
+                <p className="mt-1.5 text-muted-foreground">
+                  좌우 균형은 잡혀 있지만, 선택한 워너비 체형의 체지방률·골격근량과
+                  현재 인바디 사이에 격차가 있어 지금 이 Phase에 배정됐습니다.
+                </p>
+                {planShape === "C" ? (
+                  <p className="mt-1.5 text-muted-foreground">
+                    체지방 감량이 우선인{" "}
+                    <span className="font-semibold text-foreground">C자형</span>
+                    이라{" "}
+                    <TermTip term="compound">다관절 복합(MJ)</TermTip> 위주
+                    루틴과{" "}
+                    <TermTip term="amrap">AMRAP</TermTip> 또는{" "}
+                    <TermTip term="emom">EMOM</TermTip>으로 운동 밀도를 올리고,
+                    긴 세트 사이 휴식 때문에 심박이 떨어지는 것을 막습니다.
+                  </p>
+                ) : (
+                  <p className="mt-1.5 text-muted-foreground">
+                    대근육 위주 복합 중량 운동과{" "}
+                    <TermTip term="rest_timer">rest_timer</TermTip> 모드로 전체
+                    골격근량 베이스를 끌어올리는 구간입니다.
+                  </p>
+                )}
+              </>
+            ) : (
+              <>
+                <p className="font-bold">Phase 3 · 워너비 체형 디테일 조각</p>
+                <p className="mt-1.5 text-muted-foreground">
+                  기초 체성분·근력 베이스가 궤도에 올라, 지금 워너비 디테일
+                  Phase에 배정됐습니다.
+                </p>
+                <p className="mt-1.5 text-muted-foreground">
+                  워너비 핵심 타겟 부위와 인바디 취약 부위를 결합한{" "}
+                  <TermTip term="isolation">단일관절 고립(Isolation, SJ)</TermTip>{" "}
+                  분할을 중심으로 배정합니다.
+                </p>
+                <p className="mt-1.5 text-muted-foreground">
+                  체형 조형·근비대면{" "}
+                  <TermTip term="pct_1rm">60~80% 1RM</TermTip>
+                  (8~12회, 휴식 60~180초), 고밀도 파워형 스트렝스면{" "}
+                  <TermTip term="pct_1rm">80~100% 1RM</TermTip>
+                  (1~5회, 휴식 180~300초)을{" "}
+                  <TermTip term="rest_timer">rest_timer</TermTip>로 정밀
+                  훈련합니다.
+                </p>
+              </>
+            )}
           </div>
         </div>
       </div>
@@ -1768,7 +2038,7 @@ export function InbodyWorkoutPanel({
           <button
             type="button"
             onClick={() => setSelectedDayMark("O")}
-            disabled={selectedSlot?.mark === "O"}
+            disabled={!canApplyParked}
             className="rounded-full border border-emerald-600 px-3 py-1 text-xs font-semibold text-emerald-700 disabled:opacity-40 dark:text-emerald-300"
           >
             이 날을 운동(O)으로
@@ -1776,20 +2046,75 @@ export function InbodyWorkoutPanel({
           <button
             type="button"
             onClick={() => setSelectedDayMark("X")}
-            disabled={selectedSlot?.mark === "X"}
+            disabled={!canParkSelected}
             className="rounded-full border border-border px-3 py-1 text-xs font-semibold disabled:opacity-40"
           >
             이 날을 휴식(X)으로
           </button>
+          {canEditWeek ? (
+            <button
+              type="button"
+              onClick={() => void persistWeekPlan()}
+              disabled={!weekDirty || savingWeek}
+              className="rounded-full bg-emerald-600 px-3 py-1 text-xs font-semibold text-white disabled:opacity-40"
+            >
+              {savingWeek ? "저장 중…" : "저장하기"}
+            </button>
+          ) : null}
         </div>
+        {parkedCourses.length > 0 ? (
+          <div className="mt-2 rounded-lg border border-border p-2">
+            <p className="mb-1 text-xs font-semibold text-muted-foreground">
+              대기 코스 (위에서부터 입힘)
+            </p>
+            <ul className="space-y-0.5 text-xs">
+              {parkedCourses.map((item, index) => (
+                <li key={item.id} className="font-medium">
+                  {index === 0 ? "→ " : ""}
+                  {item.label}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+        {canEditWeek && weekDirty ? (
+          <p className="mt-1 text-xs text-amber-600 dark:text-amber-300">
+            요일 변경은 아직 저장되지 않았습니다. 저장하기를 누르세요.
+          </p>
+        ) : null}
+        {weekSaveNotice && !weekDirty ? (
+          <p className="mt-1 text-xs text-emerald-600 dark:text-emerald-300">
+            {weekSaveNotice}
+          </p>
+        ) : null}
       </div>
+
+      <div
+        className="hidden"
+        data-llm={JSON.stringify({
+          selectedDate: planDate,
+          selectedWeekday,
+          weekDirty,
+          parkedCourses: parkedCourses.map((item) => ({
+            label: item.label,
+            fromDate: item.fromDate,
+          })),
+          weekMarks: (draftWeek?.days ?? []).map((day) => ({
+            date: day.date,
+            weekday: day.weekday,
+            mark: day.mark,
+            sessionLabel: day.sessionLabel,
+            exerciseCount: day.exercises?.length ?? 0,
+          })),
+        })}
+      />
 
       <div ref={anatomyRef}>
         <AnatomyBlock
-          radar={data.radar}
+          radar={data.radar ?? []}
           weakParts={planWeak}
           targetLabels={planTargets}
-          sex={data.sex}
+          sex={data.sex ?? "male"}
           theme={theme}
           mode={
             isRestDay
@@ -1819,17 +2144,23 @@ export function InbodyWorkoutPanel({
 
       <div>
         <h3 className="mb-1 text-sm font-bold">
-          오늘의 종목
+          {selectedSlot?.dayLabel ?? ""}요일 종목
           {!isRestDay
             ? ` (${trainingVenueLabel[venue]} · ${sessionLabel})`
             : ""}
         </h3>
         {isRestDay ? (
-          <p className="rounded-lg border border-border px-3 py-4 text-sm text-muted-foreground">
+          <p
+            key={`rest-${planDate}`}
+            className="rounded-lg border border-border px-3 py-4 text-sm text-muted-foreground"
+          >
             쉬는 날(X)입니다. O인 요일을 눌러 운동 종목을 확인하세요.
+            {parkedCourses.length > 0
+              ? " 대기 코스가 있으면 이 날을 운동(O)으로 입힐 수 있습니다."
+              : ""}
           </p>
         ) : (
-          <ol className="space-y-1.5">
+          <ol key={`ex-${planDate}-${sessionLabel}`} className="space-y-1.5">
             {planExercises.map((item, index) => {
               const e1Now =
                 e1RmBySlug[item.slug] ?? item.estimated1RmKg ?? 0;
@@ -1976,6 +2307,60 @@ export function InbodyWorkoutPanel({
                         : "1RM을 입력하면 무게·횟수·세트가 표시됩니다."}
                     </p>
                   )}
+                  {mode === "rest_timer" ? (
+                    <label className="mt-1.5 flex flex-wrap items-center gap-2 text-xs">
+                      <span className="font-bold text-muted-foreground">
+                        세트 후 휴식
+                      </span>
+                      <input
+                        type="number"
+                        min={15}
+                        max={300}
+                        step={5}
+                        value={
+                          workingRestSec[item.slug] ??
+                          (item.restSec && item.restSec > 0
+                            ? item.restSec
+                            : 75)
+                        }
+                        onChange={(e) => {
+                          const raw = Number(e.target.value);
+                          const sec = Number.isFinite(raw)
+                            ? Math.max(15, Math.min(300, Math.round(raw)))
+                            : 75;
+                          setWorkingRestSec((prev) => ({
+                            ...prev,
+                            [item.slug]: sec,
+                          }));
+                        }}
+                        className="w-20 rounded border border-border bg-background px-2 py-1 font-bold"
+                      />
+                      <span className="text-muted-foreground">초</span>
+                      <div className="flex flex-wrap gap-1">
+                        {[60, 75, 90, 120].map((sec) => (
+                          <button
+                            key={sec}
+                            type="button"
+                            onClick={() =>
+                              setWorkingRestSec((prev) => ({
+                                ...prev,
+                                [item.slug]: sec,
+                              }))
+                            }
+                            className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold ${
+                              (workingRestSec[item.slug] ??
+                                item.restSec ??
+                                75) === sec
+                                ? "border-blue-600 bg-blue-600 text-white"
+                                : "border-border"
+                            }`}
+                          >
+                            {sec}s
+                          </button>
+                        ))}
+                      </div>
+                    </label>
+                  ) : null}
                   {rmOpenSlug === item.slug ? (
                     bodyweight ? (
                       <div className="mt-2 space-y-2 rounded-md border border-border bg-muted/30 p-2 text-xs">
@@ -2204,6 +2589,7 @@ export function InbodyWorkoutPanel({
       ) : null}
 
       {notice ? <p className="text-sm">{notice}</p> : null}
+      {saved ? <ChatNextHint example="운동 성장 차트 보여줘" /> : null}
     </div>
   );
 }

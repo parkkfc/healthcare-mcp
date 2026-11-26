@@ -4,8 +4,7 @@ import { trainingDocs } from "./db/schema.js";
 
 export const trainingDocTopics = [
   "daily_kcal",
-  "exercise_selection",
-  "inbody_1rm",
+  "workout_course",
 ] as const;
 
 export type TrainingDocTopic = (typeof trainingDocTopics)[number];

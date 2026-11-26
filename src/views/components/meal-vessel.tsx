@@ -14,37 +14,46 @@ function round1(n: number): number {
   return Math.round(n * 10) / 10;
 }
 
-/** Default bowl: diameter ≈ palm width (photo scale), height ≈ palm × 5/10. */
+/** Typical Korean personal bowls (interim until photo palm comparison arrives). */
+export function typicalBowlDiameterCm(role: "rice" | "soup"): number {
+  return role === "soup" ? 13.2 : 11.5;
+}
+
+/** Default bowl: height ≈ palm × 5/10. Diameter is typical or photo — never copy hand width. */
 export function defaultVessel(
   handLengthCm: number,
   handWidthCm = 0,
+  role: "rice" | "soup" = "rice",
 ): VesselState {
+  void handWidthCm;
   const palm = handLengthCm > 0 ? handLengthCm : 18;
-  const diameter =
-    handWidthCm > 0 ? handWidthCm : handLengthCm > 0 ? handLengthCm : 12;
   return {
-    diameterCm: round1(diameter),
+    diameterCm: typicalBowlDiameterCm(role),
     heightCm: round1(palm * 0.5),
     fillRatio: 0.85,
     servings: 1,
   };
 }
 
-/** Locked diameter from photo judgment, or palm width when photo is not required. */
+/**
+ * Prefer photo palm comparison. Else typical bowl.
+ * Never use saved hand width as the bowl diameter (copy forbidden).
+ */
 export function lockedVesselDiameterCm(
   handLengthCm: number,
   handWidthCm: number,
   photoDiameterCm?: number,
-  /** Photo meals: do not fall back to saved palm until the host sets photoDiameterCm. */
+  /** When true and no photo yet, return 0 (pending). */
   requirePhotoDiameter = false,
+  role: "rice" | "soup" = "rice",
 ): number {
+  void handWidthCm;
+  void handLengthCm;
   if (photoDiameterCm != null && photoDiameterCm > 0) {
     return round1(photoDiameterCm);
   }
   if (requirePhotoDiameter) return 0;
-  if (handWidthCm > 0) return round1(handWidthCm);
-  if (handLengthCm > 0) return round1(handLengthCm);
-  return 12;
+  return typicalBowlDiameterCm(role);
 }
 
 const BOWL_PX = 190;
@@ -55,6 +64,8 @@ export function MealVesselControls({
   handWidthCm = 0,
   photoDiameterCm,
   requirePhotoDiameter = false,
+  awaitingPhotoCompare = false,
+  bowlRole = "rice",
   value,
   onChange,
   label,
@@ -62,10 +73,13 @@ export function MealVesselControls({
 }: {
   handLengthCm: number;
   handWidthCm?: number;
-  /** Photo-judged bowl diameter (cm). Seeds the editable rim. */
+  /** Photo palm×bowl comparison diameter (cm). */
   photoDiameterCm?: number;
-  /** When true, diameter stays pending until photo or user sets a value. */
+  /** When true and no value yet, keep diameter empty. */
   requirePhotoDiameter?: boolean;
+  /** Photo meal still waiting for host palm comparison; typical interim may show. */
+  awaitingPhotoCompare?: boolean;
+  bowlRole?: "rice" | "soup";
   value: VesselState;
   onChange: (next: VesselState) => void;
   label: string;
@@ -84,16 +98,21 @@ export function MealVesselControls({
           handWidthCm,
           photoSeed > 0 ? photoSeed : undefined,
           requirePhotoDiameter,
+          bowlRole,
         );
   const diameterPending = requirePhotoDiameter && !(diameterCm > 0);
+  const usingTypicalInterim =
+    awaitingPhotoCompare && photoSeed <= 0 && diameterCm > 0;
   const diameterUserEdited =
     photoSeed > 0 &&
     value.diameterCm > 0 &&
     Math.abs(value.diameterCm - photoSeed) > 0.05;
 
   useEffect(() => {
-    if (photoSeed > 0 && !(value.diameterCm > 0)) {
-      onChange({ ...value, diameterCm: photoSeed });
+    if (photoSeed > 0) {
+      if (Math.abs(value.diameterCm - photoSeed) > 0.05 || !(value.diameterCm > 0)) {
+        onChange({ ...value, diameterCm: photoSeed });
+      }
       return;
     }
     if (
@@ -103,7 +122,7 @@ export function MealVesselControls({
     ) {
       onChange({ ...value, diameterCm });
     }
-    // Seed once from photo or palm fallback; avoid looping on every onChange.
+    // Seed from photo comparison or typical interim once.
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional seed-only
   }, [photoSeed, requirePhotoDiameter]);
 
@@ -230,8 +249,12 @@ export function MealVesselControls({
       <p className="text-center text-sm font-bold">{label} 그릇</p>
       <p className="mt-0.5 text-center text-xs text-muted-foreground">
         {diameterPending
-          ? "사진 손바닥으로 지름 판별 중 · 아래에서 직접 고를 수도 있습니다"
-          : "지름은 사진 손바닥 비교값(수정 가능) · 높이는 손바닥 비율로 조절"}
+          ? "사진 손바닥으로 지름 비교 중 · 아래에서 직접 고를 수도 있습니다"
+          : photoSeed > 0
+            ? "지름은 사진 손바닥 비교값(수정 가능) · 높이는 손바닥 비율로 조절"
+            : usingTypicalInterim
+              ? "일반 공기 임시값 · 사진 손바닥 비교가 오면 바로 갱신됩니다"
+              : "지름·높이는 손바닥 비율로 조절(수정 가능)"}
       </p>
 
       <div className="mt-4 w-full overflow-x-auto">
@@ -325,7 +348,11 @@ export function MealVesselControls({
                     fontSize={11}
                     fontWeight={700}
                   >
-                    {diameterPending ? "지름 판별 중" : `지름 ${diameterCm}cm`}
+                    {diameterPending
+                      ? "지름 비교 중"
+                      : usingTypicalInterim
+                        ? `임시 ${diameterCm}cm`
+                        : `지름 ${diameterCm}cm`}
                   </text>
                 </svg>
               </div>
@@ -337,7 +364,7 @@ export function MealVesselControls({
       <p className="mt-2 text-center text-xs tabular-nums text-muted-foreground">
         {diameterPending ? (
           <>
-            <span className="font-bold text-foreground">지름 판별 중</span>
+            <span className="font-bold text-foreground">지름 비교 중</span>
             {" · 사진 속 손바닥과 그릇을 비교하는 중… · 높이 "}
             <span className="font-bold text-foreground">{value.heightCm}cm</span>
             {" = 손바닥의 "}
@@ -352,7 +379,9 @@ export function MealVesselControls({
               ? " (직접 수정)"
               : photoSeed > 0
                 ? " (사진 손바닥 비교 · 수정 가능)"
-                : " (직접 선택 · 수정 가능)"}
+                : usingTypicalInterim
+                  ? " (일반 공기 임시 · 사진 비교 대기)"
+                  : " (직접 선택 · 수정 가능)"}
             {" · 높이 "}
             <span className="font-bold text-foreground">{value.heightCm}cm</span>
             {" = 손바닥의 "}
@@ -374,7 +403,11 @@ export function MealVesselControls({
           max={40}
           step={0.1}
           value={diameterText}
-          placeholder={diameterPending ? "판별 중 · 직접 입력 가능" : "예: 12"}
+          placeholder={
+            diameterPending || usingTypicalInterim
+              ? "사진 비교 중 · 직접 입력 가능"
+              : "예: 12"
+          }
           onChange={(event) => {
             const raw = event.target.value;
             if (raw !== "" && !/^\d*\.?\d*$/.test(raw)) return;

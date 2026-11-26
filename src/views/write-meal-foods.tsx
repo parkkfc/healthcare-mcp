@@ -9,9 +9,15 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { useFiles, useModelContext, useSendFollowUpMessage, useUser } from "skybridge/web";
+import { useFiles, useModelContext, useUser } from "skybridge/web";
 import { useCallTool, useToolInfo } from "@/helpers.js";
-import { mealPortionKey, parseAmountNote, type MealCuisine, type MealPortionRole } from "@/meal-portions.js";
+import {
+  coerceMealPortionRole,
+  mealPortionKey,
+  parseAmountNote,
+  type MealCuisine,
+  type MealPortionRole,
+} from "@/meal-portions.js";
 import {
   defaultVessel,
   lockedVesselDiameterCm,
@@ -20,9 +26,10 @@ import {
 } from "./components/meal-vessel.js";
 import { HostFileImage } from "./components/host-file-image.js";
 import { SourceFooter } from "./components/source-footer.js";
-import { bumpProfile } from "./profile-sync.js";
+import { ChatNextHint } from "./components/chat-next-hint.js";
+import { bumpProfile } from "../hooks/profile-sync.js";
 import { useAccountKey } from "./use-account-key.js";
-import { useAssistantContext } from "./use-assistant-context.js";
+import { useAssistantContext } from "../hooks/use-assistant-context.js";
 
 const mealSlots = ["breakfast", "lunch", "dinner", "snack"] as const;
 type MealSlot = (typeof mealSlots)[number];
@@ -68,13 +75,73 @@ type FoodDraft = {
   servingGrams: number;
   servingKcal: number;
   kcalPer100g: number;
+  /** Rice/soup DB miss only: macros per 100 g (with kcalPer100g). */
+  carbPer100g: number;
+  proteinPer100g: number;
+  fatPer100g: number;
   /** kcal of one typed unit (1줌, 1장). Not per gram. */
   kcalPerUnit: number;
   carbPerUnit: number;
   proteinPerUnit: number;
   fatPerUnit: number;
+  /** Host-judged bulk density (g/ml). 0 = server fallback. */
+  densityGPerMl: number;
   amountMode: "vessel" | "handful" | "piece" | "text";
 };
+
+type FoodGroup = "side" | "bowl";
+
+/** Fields that change a bowl's grams. kcalPer100g from a result is excluded so a result does not invalidate itself. */
+function bowlSigOf(list: FoodDraft[]): string {
+  return list
+    .map((draft) =>
+      [
+        draft.name,
+        draft.vessel.diameterCm,
+        draft.vessel.heightCm,
+        draft.vessel.fillRatio,
+        draft.vessel.servings,
+        draft.densityGPerMl,
+        draft.matchedFoodName,
+        draft.noneOfCandidates ? 1 : 0,
+      ].join("|"),
+    )
+    .join(";");
+}
+
+function sideSigOf(list: FoodDraft[]): string {
+  return list
+    .map(
+      (draft) =>
+        `${draft.name}|${draft.amountNote}|${draft.densityGPerMl}|${draft.servingGrams}|${draft.kcalPerUnit}|${draft.matchedFoodName}|${draft.noneOfCandidates ? 1 : 0}`,
+    )
+    .join(";");
+}
+
+function kcalPer100FromBasis(kcalPerBasis: number, basis: string): number {
+  const basisG = Number.parseFloat(basis);
+  const denom = Number.isFinite(basisG) && basisG > 0 ? basisG : 100;
+  if (!(kcalPerBasis > 0)) return 0;
+  return Math.round(((kcalPerBasis * 100) / denom) * 10) / 10;
+}
+
+function densityLabel(kcalPer100g: number): string {
+  return kcalPer100g > 0 ? `100g당 ${kcalPer100g}kcal` : "";
+}
+
+function roundMacro(value: number) {
+  return Math.round(value * 10) / 10;
+}
+
+function sumNutrition(foods: SavedNutrition["foods"]): SavedNutrition {
+  return {
+    kcal: foods.reduce((sum, food) => sum + food.kcal, 0),
+    carbG: roundMacro(foods.reduce((sum, food) => sum + food.carbG, 0)),
+    proteinG: roundMacro(foods.reduce((sum, food) => sum + food.proteinG, 0)),
+    fatG: roundMacro(foods.reduce((sum, food) => sum + food.fatG, 0)),
+    foods,
+  };
+}
 
 type SavedNutrition = {
   kcal: number;
@@ -83,6 +150,8 @@ type SavedNutrition = {
   fatG: number;
   foods: {
     foodName: string;
+    /** Name the user typed; merges side and bowl lookups by name, not index. */
+    query?: string;
     kcal: number;
     carbG: number;
     proteinG: number;
@@ -178,59 +247,6 @@ function PhotoCanvas({ file, alt }: { file: File; alt: string }) {
   );
 }
 
-/** Poll for the host's answer for up to this long (the host only answers on its next turn). */
-const MISSING_POLL_MS = 3000;
-const MISSING_POLL_MAX_MS = 30 * 60_000;
-
-/** True when 1-unit kcal and at least one macro gram are filled (for charts). */
-function unitNutritionReady(prompt: {
-  kcalPerUnit: string;
-  carbPerUnit: string;
-  proteinPerUnit: string;
-  fatPerUnit: string;
-}) {
-  return (
-    Number(prompt.kcalPerUnit) > 0 &&
-    Number(prompt.carbPerUnit) +
-    Number(prompt.proteinPerUnit) +
-    Number(prompt.fatPerUnit) >
-    0
-  );
-}
-
-/** Model context + follow-up both carry note/accountKey; follow-up turns often drop modelContext. */
-function missingFoodGuide(
-  lines: string,
-  key: string,
-  accountKey: string,
-  handfulVolumeMl: number,
-) {
-  const zoomLine =
-    handfulVolumeMl > 0
-      ? `줌이면 1줌은 저장된 손 1줌 ${handfulVolumeMl}ml다. 줌을 장·개로 바꾸지 말고 그 1줌 기준이다.`
-      : `줌이면 단위를 바꾸지 말고 1줌 기준이다.`;
-  return `[먼저 처리·필수] ${lines}은 식품 DB에 같은 이름이 없다. 사용자에게 선택지·이름 변경·잡곡밥만 저장·바코드를 제안하지 마라. 일반 지식으로라도 단위 1개당 kcal·탄수화물g·단백질g·지방g를 정해 즉시 lookup-meal-portions에 kcalPerUnit·carbPerUnit·proteinPerUnit·fatPerUnit을 넣어라(2장이면 1장당). 탄단지가 0이면 홈·기간 차트에 안 잡힌다. DB가 아니라고 멈추지 마라. note·accountKey는 아래 값을 한 글자도 바꾸지 마라. 키를 묻거나 지어내지 마라. ${zoomLine} 사진·손바닥을 다시 요구하지 마라. 채팅에 숫자만 답하지 마라. name은 사용자가 적은 그대로, nameConfirmed는 넣지 마라.\nnote:\n${key}\naccountKey=${accountKey}`;
-}
-
-/**
- * Follow-up must include note (+ accountKey). Without note the host invents a key
- * or stops; modelContext alone often does not reach the next turn.
- */
-function missingFoodChat(
-  lines: string,
-  key: string,
-  accountKey: string,
-  handfulVolumeMl: number,
-) {
-  const zoom =
-    handfulVolumeMl > 0
-      ? `줌이면 손 1줌 ${handfulVolumeMl}ml 기준.`
-      : `줌이면 손 1줌 기준.`;
-  return `${lines}은 식품 DB에 없습니다. 사용자에게 묻지 말고, 이름 바꾸기·일부만 저장·바코드를 제안하지 마세요. 일반 지식으로 단위 1개당 kcal와 탄수화물g·단백질g·지방g를 정해 지금 lookup-meal-portions에 kcalPerUnit·carbPerUnit·proteinPerUnit·fatPerUnit으로 넣으세요. 탄단지가 빠지면 차트에 안 반영됩니다. 채팅에 숫자만 답하지 마세요. note·accountKey는 아래 그대로(지어내지 마세요). 사진·손바닥 재요청 금지. ${zoom}
-note:
-${key}
-accountKey=${accountKey}`;
-}
 
 type CandidateOption = {
   foodName: string;
@@ -248,11 +264,43 @@ type WebPrompt = {
   fatPerUnit: string;
   webMiss: boolean;
   servingGrams: string;
+  /** Rice/soup: the numbers are per 100 g, not per 1공기. */
+  per100g: boolean;
   needsCandidatePick: boolean;
   candidates: CandidateOption[];
   /** Chosen DB name, or "__none__" for 목록에 없음. */
   selectedPick: string;
 };
+
+/** True when 1-unit kcal and at least one macro gram are filled (for charts). */
+function unitNutritionReady(prompt: {
+  kcalPerUnit: string;
+  carbPerUnit: string;
+  proteinPerUnit: string;
+  fatPerUnit: string;
+}) {
+  return (
+    Number(prompt.kcalPerUnit) > 0 &&
+    Number(prompt.carbPerUnit) +
+      Number(prompt.proteinPerUnit) +
+      Number(prompt.fatPerUnit) >
+      0
+  );
+}
+
+/** Assistant-only context when server estimate fails; no composer follow-up. */
+function missingFoodGuide(
+  lines: string,
+  key: string,
+  accountKey: string,
+  handfulVolumeMl: number,
+) {
+  const zoomLine =
+    handfulVolumeMl > 0
+      ? `줌이면 1줌은 저장된 손 1줌 ${handfulVolumeMl}ml다. 줌을 장·개로 바꾸지 말고 그 1줌 기준이다.`
+      : `줌이면 단위를 바꾸지 말고 1줌 기준이다.`;
+  return `[먼저 처리·필수] ${lines}은 식품 DB에 같은 이름이 없다. 사용자에게 선택지·이름 변경·잡곡밥만 저장·바코드를 제안하지 마라. 일반 지식으로라도 단위 1개당 kcal·탄수화물g·단백질g·지방g를 정해 즉시 lookup-meal-portions에 kcalPerUnit·carbPerUnit·proteinPerUnit·fatPerUnit을 넣어라(2장이면 1장당). 탄단지가 0이면 홈·기간 차트에 안 잡힌다. DB가 아니라고 멈추지 마라. note·accountKey는 아래 값을 한 글자도 바꾸지 마라. 키를 묻거나 지어내지 마라. ${zoomLine} 사진·손바닥을 다시 요구하지 마라. 채팅에 숫자만 답하지 마라. name은 사용자가 적은 그대로, nameConfirmed는 넣지 마라.\nnote:\n${key}\naccountKey=${accountKey}`;
+}
 
 function failureText(error: unknown): string {
   const raw = error instanceof Error ? error.message : String(error ?? "");
@@ -263,136 +311,154 @@ function failureText(error: unknown): string {
   return "저장하지 못했습니다. 다시 눌러 주세요.";
 }
 
-function draftsFromNote(
+function splitFoodToken(raw: string): { name: string; amountNote: string } {
+  const text = raw.replace(/^(아침|점심|저녁|간식)\s*[/:]?\s*/, "").trim();
+  const match = text.match(
+    /^(.*\S)\s+(\d+(?:\.\d+)?\s*(?:줌|개|장|공기|그릇|잔|인분|봉지|조각)|반\s*줌)$/,
+  );
+  if (!match) return { name: text, amountNote: "" };
+  return { name: match[1].trim(), amountNote: match[2].replace(/\s+/g, "") };
+}
+
+function mealFromNote(note: string): MealSlot | null {
+  const head = note.trim().slice(0, 6);
+  if (head.startsWith("아침")) return "breakfast";
+  if (head.startsWith("점심")) return "lunch";
+  if (head.startsWith("저녁")) return "dinner";
+  if (head.startsWith("간식")) return "snack";
+  return null;
+}
+
+type HostFoodItem = {
+  name: string;
+  role?: string;
+  amountNote?: string;
+  /** Photo palm×bowl comparison (cm). Never copy hand width. */
+  containerDiameterCm?: number;
+  thicknessCm?: number;
+  /** Host-judged bulk density (g/ml). */
+  densityGPerMl?: number;
+  /** K-FCDB density only. Total kcal waits for bowl confirm. */
+  kcalPer100g?: number;
+};
+
+function draftFromHostItem(
+  item: HostFoodItem,
+  meal: MealSlot,
+  handLengthCm: number,
+  handWidthCm = 0,
+): FoodDraft {
+  const name = item.name.trim();
+  const role: MealPortionRole =
+    meal === "snack" ? "snack" : coerceMealPortionRole(item.role);
+  const cuisine: MealCuisine =
+    meal === "snack" ? "snack" : role === "main" ? "western" : "korean";
+  // Bowl UI only when host marked rice/soup. No name-based guessing.
+  const amountMode: FoodDraft["amountMode"] =
+    meal === "snack"
+      ? "piece"
+      : role === "rice" || role === "soup"
+        ? "vessel"
+        : role === "meat" || role === "fried" || role === "side"
+          ? "handful"
+          : "text";
+  const isBowl = role === "rice" || role === "soup";
+  const bowlRole = role === "soup" ? "soup" : "rice";
+  const photoCm =
+    typeof item.containerDiameterCm === "number" && item.containerDiameterCm > 0
+      ? Math.round(item.containerDiameterCm * 10) / 10
+      : 0;
+  const base = defaultVessel(handLengthCm, handWidthCm, bowlRole);
+  const heightCm =
+    typeof item.thicknessCm === "number" && item.thicknessCm > 0
+      ? Math.round(item.thicknessCm * 10) / 10
+      : base.heightCm;
+  const density =
+    typeof item.densityGPerMl === "number" && item.densityGPerMl > 0
+      ? Math.round(item.densityGPerMl * 100) / 100
+      : 0;
+  const kcalPer100g =
+    typeof item.kcalPer100g === "number" && item.kcalPer100g > 0
+      ? Math.round(item.kcalPer100g * 10) / 10
+      : 0;
+  return {
+    name,
+    role,
+    cuisine,
+    handfuls: 0,
+    pieceCount: 0,
+    amountNote: (item.amountNote ?? "").trim(),
+    nameConfirmed: false,
+    candidateName: "",
+    matchedFoodName: "",
+    noneOfCandidates: false,
+    sharedPot: false,
+    photoDiameterCm: photoCm,
+    vessel: isBowl
+      ? {
+          ...base,
+          // Photo meals seed only host palm×bowl cm; never a typical interim.
+          diameterCm: photoCm > 0 ? photoCm : 0,
+          heightCm,
+        }
+      : base,
+    servingGrams: 0,
+    servingKcal: 0,
+    kcalPer100g,
+    carbPer100g: 0,
+    proteinPer100g: 0,
+    fatPer100g: 0,
+    kcalPerUnit: 0,
+    carbPerUnit: 0,
+    proteinPerUnit: 0,
+    fatPerUnit: 0,
+    densityGPerMl: density,
+    amountMode,
+  };
+}
+
+/** Prefer host items (with AI roles). Note-only fallback keeps amounts, role=side. */
+function draftsFromHost(
+  items: HostFoodItem[] | undefined,
   note: string,
   meal: MealSlot,
   handLengthCm: number,
   handWidthCm = 0,
 ): FoodDraft[] {
+  if (Array.isArray(items) && items.length > 0) {
+    return items
+      .filter((item) => item.name.trim().length > 0)
+      .map((item) => draftFromHostItem(item, meal, handLengthCm, handWidthCm));
+  }
   const parts = note
-    .split(/[,，、/\n]+/)
+    .replace(/^(아침|점심|저녁|간식)\s*[/:]?\s*/, "")
+    .split(/[,，、\n]+/)
     .map((part) => part.trim())
     .filter(Boolean);
-  return parts.map((name) => {
-    const lower = name;
-    let role: MealPortionRole = "side";
-    if (meal === "snack") role = "snack";
-    else if (
-      /밥|공기밥|흰밥|현미|잡곡|흑미|보리밥|오곡|죽|덮밥|비빔밥|볶음밥/.test(
-        lower,
-      )
-    )
-      role = "rice";
-    else if (
-      /국|찌개|탕|전골|육개장|순두부|청국장|부대|김치찌개|된장|미역|콩나물|설렁|곰탕|해장|라면|우동|국수|칼국수|수제비|짬뽕/.test(
-        lower,
-      )
-    )
-      role = "soup";
-    else if (/고기|불고기|삼겹|치킨|닭|돼지|소고기|갈비/.test(lower))
-      role = "meat";
-    else if (/튀김|전|까스|너겟/.test(lower)) role = "fried";
-    else if (/면|파스타|피자|스테이크|리조토|샐러드/.test(lower)) role = "main";
-
-    const cuisine: MealCuisine =
-      meal === "snack"
-        ? "snack"
-        : role === "main" && /면|파스타|피자|스테이크|리조토|샐러드/.test(lower)
-          ? "western"
-          : "korean";
-
-    // Bowl UI only for rice/soup. Pizza·pasta etc. use typed amount (조각·판).
-    const amountMode: FoodDraft["amountMode"] =
-      meal === "snack"
-        ? "piece"
-        : role === "rice" || role === "soup"
-          ? "vessel"
-          : role === "meat" || role === "fried" || role === "side"
-            ? "handful"
-            : "text";
-
-    return {
-      name,
-      role,
-      cuisine: meal === "snack" ? "snack" : cuisine,
-      handfuls: 0,
-      pieceCount: 0,
-      amountNote: "",
-      nameConfirmed: false,
-      candidateName: "",
-      matchedFoodName: "",
-      noneOfCandidates: false,
-      sharedPot: false,
-      photoDiameterCm: 0,
-      vessel: {
-        ...defaultVessel(handLengthCm, handWidthCm),
-        // Photo meals fill diameter from host/user; keep 0 until then for rice/soup.
-        diameterCm:
-          role === "rice" || role === "soup"
-            ? 0
-            : defaultVessel(handLengthCm, handWidthCm).diameterCm,
+  return parts.map((part) => {
+    const parsed = splitFoodToken(part);
+    return draftFromHostItem(
+      {
+        name: parsed.name,
+        role: meal === "snack" ? "snack" : "side",
+        amountNote: parsed.amountNote,
       },
-      servingGrams: 0,
-      servingKcal: 0,
-      kcalPer100g: 0,
-      kcalPerUnit: 0,
-      carbPerUnit: 0,
-      proteinPerUnit: 0,
-      fatPerUnit: 0,
-      amountMode,
-    };
+      meal,
+      handLengthCm,
+      handWidthCm,
+    );
   });
 }
 
-export function MealRecordPanel({
-  accountKey,
-  date,
-  handWidthCm = 0,
-  handLengthCm = 0,
-  handfulVolumeMl = 0,
-}: {
-  accountKey: string;
-  date: string;
-  handWidthCm?: number;
-  handLengthCm?: number;
-  handfulVolumeMl?: number;
-}) {
-  return (
-    <WriteMealFoods
-      embedded
-      date={date}
-      accountKey={accountKey}
-      handWidthCm={handWidthCm}
-      handLengthCm={handLengthCm}
-      handfulVolumeMl={handfulVolumeMl}
-    />
-  );
-}
-
-export default function WriteMealFoods({
-  embedded = false,
-  date: dateProp,
-  accountKey: accountKeyProp,
-  handWidthCm: handWidthProp = 0,
-  handLengthCm: handLengthProp = 0,
-  handfulVolumeMl: handfulProp = 0,
-}: {
-  embedded?: boolean;
-  date?: string;
-  accountKey?: string;
-  handWidthCm?: number;
-  handLengthCm?: number;
-  handfulVolumeMl?: number;
-} = {}) {
+export default function WriteMealFoods() {
   const { theme } = useUser();
   const toolInfo = useToolInfo<"write-meal-foods">();
   const { callToolAsync, isPending } = useCallTool("record-meal-photos");
   const { callToolAsync: lookupPortions } = useCallTool("lookup-meal-portions");
+  const { callToolAsync: estimateUnit } = useCallTool("estimate-unit-nutrition");
   const { getDownloadUrl } = useFiles();
   const { update: updateModelContext } = useModelContext();
-  const sendMessage = useSendFollowUpMessage();
-  const storedKey = useAccountKey();
-  const accountKey = accountKeyProp || storedKey;
+  const accountKey = useAccountKey();
 
   const [note, setNote] = useState("");
   const [meal, setMeal] = useState<MealSlot>("lunch");
@@ -400,7 +466,7 @@ export default function WriteMealFoods({
   const [nutrition, setNutrition] = useState<SavedNutrition | null>(null);
   const [failed, setFailed] = useState("");
   const [summary, setSummary] = useState("");
-  const [picked, setPicked] = useState<File | null>(null);
+  const [picked] = useState<File | null>(null);
   const [waiting, setWaiting] = useState(false);
   const [webPrompts, setWebPrompts] = useState<WebPrompt[]>([]);
   const [foodsAccepted, setFoodsAccepted] = useState(false);
@@ -410,7 +476,6 @@ export default function WriteMealFoods({
   const [drafts, setDrafts] = useState<FoodDraft[]>([]);
   /** Host confirmed palm in photo via vesselHints (handInPhoto true). */
   const [hostSawPalm, setHostSawPalm] = useState(false);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const askedHostRef = useRef({ stamp: "", at: 0 });
   /** True only after kcal 계산 found a DB miss; keeps empty peeks from reopening the panel. */
   const expectMissingRef = useRef(false);
@@ -420,12 +485,23 @@ export default function WriteMealFoods({
   draftsRef.current = drafts;
   /** User closed the miss panel for this portion key. */
   const dismissedMissRef = useRef("");
-
-  useEffect(() => {
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
-    };
-  }, []);
+  /**
+   * Sides (반찬) are looked up on their own and shown right away. Rice/soup are
+   * looked up only when the user presses 「열량 계산」 after setting the bowl.
+   * Both lists are merged by the name the user typed.
+   */
+  const [sideFoods, setSideFoods] = useState<SavedNutrition["foods"] | null>(
+    null,
+  );
+  const [bowlFoods, setBowlFoods] = useState<SavedNutrition["foods"] | null>(
+    null,
+  );
+  const sideFoodsRef = useRef<SavedNutrition["foods"] | null>(null);
+  const bowlFoodsRef = useRef<SavedNutrition["foods"] | null>(null);
+  /** Signature of the side drafts the last side lookup ran for. */
+  const sideCalcSigRef = useRef("");
+  /** Signature of the bowl drafts the current bowl result was computed from. */
+  const bowlCalcSigRef = useRef("");
 
   // A text cursor must not scroll the meal card. The browser scrolls a
   // focused field into view after pointerdown, so keep the position from
@@ -530,7 +606,7 @@ export default function WriteMealFoods({
   }, []);
 
   const hostPhoto = useMemo(() => {
-    if (embedded || !toolInfo.isSuccess) return emptyPhoto();
+    if (!toolInfo.isSuccess) return emptyPhoto();
     const buckets = [
       toolInfo.output.photos,
       toolInfo.input?.photos,
@@ -542,39 +618,130 @@ export default function WriteMealFoods({
       if (parsed) return parsed;
     }
     return emptyPhoto();
-  }, [embedded, toolInfo]);
+  }, [toolInfo]);
 
-  const day =
-    embedded && dateProp
-      ? dateProp
-      : toolInfo.isSuccess
-        ? toolInfo.output.date
-        : "";
+  const day = toolInfo.isSuccess ? (toolInfo.output.date ?? "") : "";
 
   const measuredWidth =
-    handWidthProp > 0
-      ? handWidthProp
-      : toolInfo.isSuccess && typeof toolInfo.output.handWidthCm === "number"
-        ? toolInfo.output.handWidthCm
-        : 0;
+    toolInfo.isSuccess && typeof toolInfo.output.handWidthCm === "number"
+      ? toolInfo.output.handWidthCm
+      : 0;
   const measuredLength =
-    handLengthProp > 0
-      ? handLengthProp
-      : toolInfo.isSuccess && typeof toolInfo.output.handLengthCm === "number"
-        ? toolInfo.output.handLengthCm
-        : 0;
+    toolInfo.isSuccess && typeof toolInfo.output.handLengthCm === "number"
+      ? toolInfo.output.handLengthCm
+      : 0;
   const handfulVolumeMl =
-    handfulProp > 0
-      ? handfulProp
-      : toolInfo.isSuccess && typeof toolInfo.output.handfulVolumeMl === "number"
-        ? toolInfo.output.handfulVolumeMl
-        : 0;
+    toolInfo.isSuccess && typeof toolInfo.output.handfulVolumeMl === "number"
+      ? toolInfo.output.handfulVolumeMl
+      : 0;
+  const hostItems = useMemo((): HostFoodItem[] | undefined => {
+    if (!toolInfo.isSuccess) return undefined;
+    const raw = toolInfo.output.items;
+    if (!Array.isArray(raw) || raw.length === 0) return undefined;
+    return raw
+      .map((row) => ({
+        name: String(row?.name ?? "").trim(),
+        role: typeof row?.role === "string" ? row.role : undefined,
+        amountNote:
+          typeof row?.amountNote === "string" ? row.amountNote.trim() : "",
+        containerDiameterCm:
+          typeof row?.containerDiameterCm === "number"
+            ? row.containerDiameterCm
+            : undefined,
+        thicknessCm:
+          typeof row?.thicknessCm === "number" ? row.thicknessCm : undefined,
+        densityGPerMl:
+          typeof row?.densityGPerMl === "number" ? row.densityGPerMl : undefined,
+        kcalPer100g:
+          typeof row?.kcalPer100g === "number" && row.kcalPer100g > 0
+            ? row.kcalPer100g
+            : undefined,
+      }))
+      .filter((row) => row.name.length > 0);
+  }, [toolInfo]);
+
+  const seededNoteRef = useRef(false);
+  useEffect(() => {
+    if (!toolInfo.isSuccess || seededNoteRef.current) return;
+    const incoming =
+      typeof toolInfo.output.note === "string" ? toolInfo.output.note.trim() : "";
+    if (!incoming && !(hostItems && hostItems.length > 0)) return;
+    seededNoteRef.current = true;
+    const nextMeal = mealFromNote(incoming) ?? toolInfo.output.meal ?? "lunch";
+    setMeal(nextMeal);
+    if (incoming) setNote(incoming);
+    setDrafts(
+      draftsFromHost(
+        hostItems,
+        incoming,
+        nextMeal,
+        measuredLength,
+        measuredWidth,
+      ),
+    );
+  }, [toolInfo, hostItems, measuredLength, measuredWidth]);
+
+  // Host re-opens write-meal-foods with palm diameter / density → merge into drafts.
+  useEffect(() => {
+    if (!hostItems || hostItems.length === 0) return;
+    setDrafts((prev) => {
+      if (prev.length === 0) return prev;
+      let changed = false;
+      const next = prev.map((draft) => {
+        const hit = hostItems.find(
+          (item) => item.name === draft.name || draft.name.includes(item.name),
+        );
+        if (!hit) return draft;
+        const photoCm =
+          typeof hit.containerDiameterCm === "number" &&
+          hit.containerDiameterCm > 0
+            ? Math.round(hit.containerDiameterCm * 10) / 10
+            : 0;
+        const density =
+          typeof hit.densityGPerMl === "number" && hit.densityGPerMl > 0
+            ? Math.round(hit.densityGPerMl * 100) / 100
+            : 0;
+        const kcalPer100g =
+          typeof hit.kcalPer100g === "number" && hit.kcalPer100g > 0
+            ? Math.round(hit.kcalPer100g * 10) / 10
+            : 0;
+        const heightCm =
+          typeof hit.thicknessCm === "number" && hit.thicknessCm > 0
+            ? Math.round(hit.thicknessCm * 10) / 10
+            : draft.vessel.heightCm;
+        const diameterChanged =
+          photoCm > 0 && Math.abs(draft.photoDiameterCm - photoCm) >= 0.05;
+        const densityChanged =
+          density > 0 && Math.abs((draft.densityGPerMl || 0) - density) >= 0.01;
+        const kcalDensityChanged =
+          kcalPer100g > 0 &&
+          Math.abs((draft.kcalPer100g || 0) - kcalPer100g) >= 0.05;
+        if (!diameterChanged && !densityChanged && !kcalDensityChanged) {
+          return draft;
+        }
+        changed = true;
+        return {
+          ...draft,
+          photoDiameterCm: diameterChanged ? photoCm : draft.photoDiameterCm,
+          densityGPerMl: densityChanged ? density : draft.densityGPerMl,
+          kcalPer100g: kcalDensityChanged ? kcalPer100g : draft.kcalPer100g,
+          vessel: diameterChanged
+            ? {
+                ...draft.vessel,
+                diameterCm: photoCm,
+                heightCm,
+              }
+            : draft.vessel,
+        };
+      });
+      return changed ? next : prev;
+    });
+  }, [hostItems]);
 
   /** Chat-attached photo that the host vision can actually see. */
   const hasHostPhoto =
     Boolean(hostPhoto.file_id || hostPhoto.download_url) ||
-    (!embedded &&
-      toolInfo.isSuccess &&
+    (toolInfo.isSuccess &&
       typeof toolInfo.output.photoCount === "number" &&
       toolInfo.output.photoCount > 0);
   /** Local preview or host photo — not enough alone for AI diameter. */
@@ -585,35 +752,34 @@ export default function WriteMealFoods({
   const needsHand = !textOnly && meal !== "snack";
 
   useAssistantContext(
-    !embedded
-      ? JSON.stringify({
-        meal,
-        note: note.trim(),
-        ready,
-        saved,
-        hasPhoto,
-        cuisine,
-        accountKey,
-        amounts: drafts
-          .filter((draft) => draft.amountMode !== "vessel")
-          .map((draft) => ({
-            name: draft.name,
-            amountNote: draft.amountNote.trim(),
-          })),
-        missingDbFoods: webPrompts.map((prompt) => ({
-          query: prompt.query,
-          candidateName: prompt.candidateName,
-          unit: prompt.unit,
-          kcalPerUnit: Number(prompt.kcalPerUnit) || 0,
-          carbPerUnit: Number(prompt.carbPerUnit) || 0,
-          proteinPerUnit: Number(prompt.proteinPerUnit) || 0,
-          fatPerUnit: Number(prompt.fatPerUnit) || 0,
-          servingGrams: Number(prompt.servingGrams) || 0,
+    JSON.stringify({
+      meal,
+      note: note.trim(),
+      ready,
+      saved,
+      hasPhoto,
+      cuisine,
+      accountKey,
+      amounts: drafts
+        .filter((draft) => draft.amountMode !== "vessel")
+        .map((draft) => ({
+          name: draft.name,
+          amountNote: draft.amountNote.trim(),
         })),
-        handfulVolumeMl,
-        amountGuide:
-          webPrompts.some((prompt) => !unitNutritionReady(prompt))
-            ? missingFoodGuide(
+      missingDbFoods: webPrompts.map((prompt) => ({
+        query: prompt.query,
+        candidateName: prompt.candidateName,
+        unit: prompt.unit,
+        kcalPerUnit: Number(prompt.kcalPerUnit) || 0,
+        carbPerUnit: Number(prompt.carbPerUnit) || 0,
+        proteinPerUnit: Number(prompt.proteinPerUnit) || 0,
+        fatPerUnit: Number(prompt.fatPerUnit) || 0,
+        servingGrams: Number(prompt.servingGrams) || 0,
+      })),
+      handfulVolumeMl,
+      amountGuide:
+        webPrompts.some((prompt) => !unitNutritionReady(prompt))
+          ? missingFoodGuide(
               webPrompts
                 .filter((prompt) => !unitNutritionReady(prompt))
                 .map((prompt) => `${prompt.query} · ${prompt.unit || "개"}`)
@@ -622,30 +788,79 @@ export default function WriteMealFoods({
               accountKey,
               handfulVolumeMl,
             )
-            : "줌은 반찬 부피(손 1줌)다. 장·개·봉지 등 다른 단위는 사용자가 적은 그대로 판단해 pieceCount와, 무게를 알면 1단위 servingGrams를 lookup-meal-portions에 넣어라. kcal·탄단지는 g당이 아니라 그 단위 1개 기준이다. 줌/갯수를 고르라고 하지 마라. 입력창에는 쓰지 마라.",
-      })
-      : "",
+          : "섭취량은 사진으로 짐작하지 마라. 반찬·개수는 사용자가 적은 단위(줌·개·장)만 쓰고, 줌은 저장된 손 1줌이다. 밥·국 kcal는 카드에서 그릇 크기·내용물 높이를 확정한 뒤에만 나온다. 입력창에는 쓰지 마라.",
+    }),
   );
 
-  function stopPoll() {
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
+  /** Rice/soup that use the bowl UI (text-only meals treat them like sides). */
+  function isBowlDraft(draft: FoodDraft): boolean {
+    return (
+      (draft.role === "rice" || draft.role === "soup") &&
+      draft.amountMode === "vessel" &&
+      !textOnly
+    );
   }
 
-  function forgetPortion() {
-    stopPoll();
-    expectMissingRef.current = false;
-    setWaiting(false);
-    setPortionKey("");
+  function foodMatchesDraft(
+    food: SavedNutrition["foods"][number],
+    draft: FoodDraft,
+  ): boolean {
+    if (food.query) return food.query === draft.name;
+    return (
+      food.foodName === draft.name ||
+      food.foodName.includes(draft.name) ||
+      draft.name.includes(food.foodName)
+    );
+  }
+
+  /**
+   * Store one group's result (or clear it with null) and rebuild the merged card
+   * by name. 확정 = every group that exists has a result.
+   */
+  function setGroupFoods(
+    group: FoodGroup,
+    foods: SavedNutrition["foods"] | null,
+    all: FoodDraft[] = draftsRef.current,
+  ) {
+    const side = group === "side" ? foods : sideFoodsRef.current;
+    const bowl = group === "bowl" ? foods : bowlFoodsRef.current;
+    sideFoodsRef.current = side;
+    bowlFoodsRef.current = bowl;
+    setSideFoods(side);
+    setBowlFoods(bowl);
+    const hasSide = all.some((draft) => !isBowlDraft(draft));
+    const hasBowl = all.some((draft) => isBowlDraft(draft));
+    const order = (food: SavedNutrition["foods"][number]) => {
+      const at = all.findIndex((draft) => foodMatchesDraft(food, draft));
+      return at < 0 ? 999 : at;
+    };
+    const merged = [...(side ?? []), ...(bowl ?? [])].sort(
+      (a, b) => order(a) - order(b),
+    );
+    setNutrition(merged.length > 0 ? sumNutrition(merged) : null);
+    setConfirmed(
+      merged.length > 0 &&
+        (!hasSide || side !== null) &&
+        (!hasBowl || bowl !== null),
+    );
+  }
+
+  function resetFoods() {
+    sideFoodsRef.current = null;
+    bowlFoodsRef.current = null;
+    sideCalcSigRef.current = "";
+    bowlCalcSigRef.current = "";
+    setSideFoods(null);
+    setBowlFoods(null);
+    setNutrition(null);
     setConfirmed(false);
-    setWebPrompts([]);
-    setFoodsAccepted(false);
-    if (!saved) setNutrition(null);
   }
 
-  function applyPortionFoods(foods: unknown): boolean {
+  function applyPortionFoods(
+    foods: unknown,
+    group: FoodGroup,
+    all: FoodDraft[],
+  ): boolean {
     if (!Array.isArray(foods) || foods.length === 0) return false;
     const parsed = foods.flatMap((item) => {
       if (!item || typeof item !== "object") return [];
@@ -656,6 +871,7 @@ export default function WriteMealFoods({
       return [
         {
           foodName,
+          query: String(row.query ?? "").trim() || undefined,
           grams,
           kcal: Number(row.kcal) || 0,
           carbG: Number(row.carbG) || 0,
@@ -671,253 +887,22 @@ export default function WriteMealFoods({
       ];
     });
     if (parsed.length === 0) return false;
-    setNutrition({
-      kcal: parsed.reduce((sum, food) => sum + food.kcal, 0),
-      carbG:
-        Math.round(parsed.reduce((sum, food) => sum + food.carbG, 0) * 10) / 10,
-      proteinG:
-        Math.round(parsed.reduce((sum, food) => sum + food.proteinG, 0) * 10) /
-        10,
-      fatG:
-        Math.round(parsed.reduce((sum, food) => sum + food.fatG, 0) * 10) / 10,
-      foods: parsed,
-    });
+    // Show DB kcal per 100 g on the card; match by typed name, not by index.
+    setDrafts((prev) =>
+      prev.map((draft) => {
+        const food = parsed.find((row) => foodMatchesDraft(row, draft));
+        if (!food) return draft;
+        const per100 =
+          food.kcalPerBasis > 0
+            ? kcalPer100FromBasis(food.kcalPerBasis, food.basis || "100g")
+            : 0;
+        return per100 > 0 ? { ...draft, kcalPer100g: per100 } : draft;
+      }),
+    );
+    setGroupFoods(group, parsed, all);
     setWaiting(false);
     setFailed("");
     return true;
-  }
-
-  function normalizeName(value: string) {
-    return value.replace(/\s+/g, "").toLowerCase();
-  }
-
-  function applyVesselHints(foods: unknown): boolean {
-    if (!Array.isArray(foods) || foods.length === 0) return false;
-    if (
-      foods.some((item) => {
-        if (!item || typeof item !== "object") return false;
-        const row = item as Record<string, unknown>;
-        return row.handMissing === true || row.needsHandRetry === true;
-      })
-    ) {
-      return false;
-    }
-    const base =
-      drafts.length > 0
-        ? drafts
-        : draftsFromNote(note, meal, measuredLength, measuredWidth);
-    const unused = new Set(
-      foods.flatMap((item, index) => {
-        if (!item || typeof item !== "object") return [];
-        const row = item as Record<string, unknown>;
-        return row.needsVesselHint === true ? [index] : [];
-      }),
-    );
-    let changed = false;
-    let sawPalm = false;
-    const next = base.map((draft) => {
-      const findHit = (): Record<string, unknown> | undefined => {
-        for (const index of unused) {
-          const item = foods[index];
-          if (!item || typeof item !== "object") continue;
-          const row = item as Record<string, unknown>;
-          const query = String(row.query ?? row.foodName ?? "").trim();
-          if (normalizeName(query) === normalizeName(draft.name)) {
-            unused.delete(index);
-            return row;
-          }
-        }
-        for (const index of unused) {
-          const item = foods[index];
-          if (!item || typeof item !== "object") continue;
-          const row = item as Record<string, unknown>;
-          const query = normalizeName(
-            String(row.query ?? row.foodName ?? "").trim(),
-          );
-          const name = normalizeName(draft.name);
-          if (query && name && (query.includes(name) || name.includes(query))) {
-            unused.delete(index);
-            return row;
-          }
-        }
-        if (draft.role === "rice" || draft.role === "soup") {
-          const roleHits = [...unused].flatMap((index) => {
-            const item = foods[index];
-            if (!item || typeof item !== "object") return [];
-            const row = item as Record<string, unknown>;
-            const role = String(row.role ?? "");
-            return role === draft.role ? [{ index, row }] : [];
-          });
-          if (roleHits.length === 1) {
-            unused.delete(roleHits[0].index);
-            return roleHits[0].row;
-          }
-        }
-        return undefined;
-      };
-      const hit = findHit();
-      if (!hit || hit.needsVesselHint !== true) return draft;
-      changed = true;
-      const shared = hit.sharedPot === true;
-      const photoD = Number(hit.photoDiameterCm) || 0;
-      const thick = Number(hit.thicknessCm) || 0;
-      if (hit.handInPhoto === true || (!shared && photoD > 0)) sawPalm = true;
-      if (shared) {
-        return {
-          ...draft,
-          sharedPot: true,
-          photoDiameterCm: 0,
-          amountMode: "text" as const,
-          amountNote: draft.amountNote.trim() || "",
-        };
-      }
-      const diameterCm =
-        photoD > 0
-          ? photoD
-          : lockedVesselDiameterCm(measuredLength, measuredWidth);
-      return {
-        ...draft,
-        sharedPot: false,
-        photoDiameterCm: photoD > 0 ? photoD : draft.photoDiameterCm,
-        amountMode: "vessel" as const,
-        vessel: {
-          ...draft.vessel,
-          diameterCm,
-          heightCm:
-            thick > 0
-              ? thick
-              : draft.vessel.heightCm ||
-              defaultVessel(measuredLength, measuredWidth).heightCm,
-        },
-      };
-    });
-    if (changed) {
-      draftsRef.current = next;
-      setDrafts(next);
-      if (sawPalm) setHostSawPalm(true);
-      setWaiting(false);
-    }
-    return changed;
-  }
-
-  /** True only when portion foods were applied. Still-waiting is not done. */
-  async function peekPortion(key: string): Promise<boolean> {
-    try {
-      const result = await lookupPortions({ note: key, accountKey });
-      const out = result.structuredContent as
-        | (Record<string, unknown> & {
-          foods?: unknown;
-          needsVesselHints?: boolean;
-          needsWebConfirm?: boolean;
-          handMissing?: boolean;
-          needsHandRetry?: boolean;
-          handInPhoto?: boolean;
-          ok?: boolean;
-          message?: string;
-        })
-        | null
-        | undefined;
-      const foodsMissingHand =
-        Array.isArray(out?.foods) &&
-        out.foods.some((item) => {
-          if (!item || typeof item !== "object") return false;
-          const row = item as Record<string, unknown>;
-          return (
-            row.handMissing === true ||
-            row.needsHandRetry === true ||
-            row.handInPhoto === false
-          );
-        });
-      if (
-        out?.handMissing === true ||
-        out?.needsHandRetry === true ||
-        out?.handInPhoto === false ||
-        foodsMissingHand
-      ) {
-        stopPoll();
-        setWaiting(false);
-        setHostSawPalm(false);
-        setFailed(
-          out?.message ||
-          "사진에 손바닥이 보이지 않아 그릇 지름을 판별할 수 없습니다. 그릇 옆에 손바닥을 두고 다시 찍어 올려 주세요.",
-        );
-        return false;
-      }
-      if (out?.needsVesselHints && applyVesselHints(out.foods)) {
-        setWaiting(false);
-        // Hints are applied; keep polling briefly so host can refine, but unlock UI.
-        return false;
-      }
-      const prompts = out ? readWebPrompts(out) : null;
-      if (prompts) {
-        const hasActionable = prompts.some(
-          (prompt) =>
-            prompt.needsCandidatePick || unitNutritionReady(prompt),
-        );
-        // Do not reopen an empty "not in DB" panel from background peeks
-        // (구성 확인, 폴링) after the user closed it or never asked.
-        if (
-          !hasActionable &&
-          webPromptsRef.current.length === 0 &&
-          !expectMissingRef.current
-        ) {
-          return false;
-        }
-        if (!hasActionable && dismissedMissRef.current === key) {
-          return false;
-        }
-        setWebPrompts((prev) =>
-          prompts.map((prompt) => {
-            const older = prev.find((item) => item.query === prompt.query);
-            if (!older) return prompt;
-            // Already answered: do not overwrite what the user is reviewing.
-            if (unitNutritionReady(older)) return older;
-            if (older.needsCandidatePick && older.selectedPick) return older;
-            return {
-              ...prompt,
-              candidateName:
-                prompt.candidateName && prompt.candidateName !== prompt.query
-                  ? prompt.candidateName
-                  : older.candidateName || prompt.candidateName,
-              kcalPerUnit: prompt.kcalPerUnit || older.kcalPerUnit,
-              carbPerUnit: prompt.carbPerUnit || older.carbPerUnit,
-              proteinPerUnit: prompt.proteinPerUnit || older.proteinPerUnit,
-              fatPerUnit: prompt.fatPerUnit || older.fatPerUnit,
-              webMiss: unitNutritionReady(prompt) ? false : prompt.webMiss,
-              unit: prompt.unit || older.unit,
-              servingGrams: prompt.servingGrams || older.servingGrams,
-              needsCandidatePick:
-                prompt.needsCandidatePick || older.needsCandidatePick,
-              candidates:
-                prompt.candidates.length > 0
-                  ? prompt.candidates
-                  : older.candidates,
-              selectedPick: older.selectedPick || prompt.selectedPick,
-            };
-          }),
-        );
-        setWaiting(false);
-        const picksReady = prompts.every(
-          (prompt) =>
-            prompt.needsCandidatePick || unitNutritionReady(prompt),
-        );
-        if (picksReady) {
-          expectMissingRef.current = false;
-          stopPoll();
-        }
-        return false;
-      }
-      if (out?.ok && applyPortionFoods(out.foods)) {
-        stopPoll();
-        expectMissingRef.current = false;
-        dismissedMissRef.current = "";
-        setWebPrompts([]);
-        return true;
-      }
-      return false;
-    } catch {
-      return false;
-    }
   }
 
   function buildFoodsPayload(source: FoodDraft[] = drafts) {
@@ -928,7 +913,9 @@ export default function WriteMealFoods({
         name: draft.name,
         role: draft.role,
         cuisine: textOnly ? ("text" as const) : draft.cuisine,
-        densityGPerMl: 1,
+        // Host density when set; else server resolveFoodDensityGPerMl fallback.
+        densityGPerMl:
+          draft.densityGPerMl > 0 ? draft.densityGPerMl : undefined,
         handfulVolumeMl,
         servingGrams: draft.servingGrams || undefined,
         servingKcal: draft.servingKcal || undefined,
@@ -942,7 +929,7 @@ export default function WriteMealFoods({
         noneOfCandidates: draft.noneOfCandidates || undefined,
       };
       if (draft.amountMode === "vessel") {
-        const requirePhoto = hasHostPhoto && !textOnly;
+        const bowlRole = draft.role === "soup" ? "soup" : "rice";
         const diameterCm =
           draft.vessel.diameterCm > 0
             ? draft.vessel.diameterCm
@@ -950,7 +937,9 @@ export default function WriteMealFoods({
               measuredLength,
               measuredWidth,
               draft.photoDiameterCm > 0 ? draft.photoDiameterCm : undefined,
-              requirePhoto,
+              // Photo meals: never fall back to a typical interim diameter.
+              hasHostPhoto && !textOnly,
+              bowlRole,
             );
         return {
           ...base,
@@ -960,6 +949,12 @@ export default function WriteMealFoods({
           curvature: 0.35,
           fillRatio: draft.vessel.fillRatio,
           servings: draft.vessel.servings,
+          // DB miss rice/soup: per 100 g × bowl grams (never 1공기 × unit kcal).
+          kcalPer100g: draft.kcalPer100g > 0 ? draft.kcalPer100g : undefined,
+          carbPer100g: draft.carbPer100g > 0 ? draft.carbPer100g : undefined,
+          proteinPer100g:
+            draft.proteinPer100g > 0 ? draft.proteinPer100g : undefined,
+          fatPer100g: draft.fatPer100g > 0 ? draft.fatPer100g : undefined,
         };
       }
       // 사용자가 적은 단위. 줌은 부피, 그 외는 개수. 기준 g는 서버·AI가 판단.
@@ -979,87 +974,18 @@ export default function WriteMealFoods({
     });
   }
 
-  function vesselPhotoGuide(key: string, foodLines: string) {
-    return `[먼저 처리·필수] 식사 사진의 밥·국 그릇 지름을 저장된 손바닥 폭 ${measuredWidth || "?"}cm·손 길이 ${measuredLength || "?"}cm와 비교해 판별하라. 손바닥이 없으면 handInPhoto=false로 vesselHints를 호출하고 지름을 넣지 마라. 있으면 지금 lookup-meal-portions에 vesselHints만 넣어라. 개인 공기·국그릇은 사진 속 손·그릇 상단 외경 픽셀 비율×손 폭으로 containerDiameterCm·thicknessCm을 넣고, 손 폭을 지름으로 복사하지 마라. 참고 앵커: 스텐 밥공기 약 10.5cm, 가정용 도자기 밥 11.3~12.5cm, 국그릇 12.5~13.8cm, 냉면·우동·큰 면기 17~21cm. 냄비·후라이팬·전골냄비·큰 뚝배기면 sharedPot true. handInPhoto·palmComparison 필수. 사용자에게 지름을 묻지 마라. 채팅에 숫자만 답하지 마라. note·accountKey는 아래 그대로.\n대상: ${foodLines}\nnote:\n${key}\naccountKey=${accountKey}`;
-  }
-
-  function vesselsNeedPhotoDiameter(list: FoodDraft[]) {
-    if (!hasHostPhoto || textOnly || embedded) return [];
-    return list.filter(
-      (draft) =>
-        (draft.role === "rice" || draft.role === "soup") &&
-        draft.amountMode === "vessel" &&
-        !draft.sharedPot &&
-        !(draft.photoDiameterCm > 0) &&
-        !(draft.vessel.diameterCm > 0),
-    );
-  }
-
-  async function askHostForVesselDiameter(
-    key: string,
-    list: FoodDraft[],
-  ): Promise<boolean> {
-    const pending = vesselsNeedPhotoDiameter(list);
-    if (pending.length === 0) return true;
-    if (!hasHostPhoto || embedded) {
-      setWaiting(false);
-      setFailed(
-        "사진으로 그릇 지름을 판별하려면 GPT,Claude 채팅창에 손바닥과 식단 사진을 함께 올려 주세요.",
-      );
-      return false;
-    }
-    const foodLines = pending.map((draft) => draft.name).join(", ");
-    const text = vesselPhotoGuide(key, foodLines);
-    await updateModelContext({
-      content: [
-        {
-          type: "text",
-          text,
-          annotations: { audience: ["assistant"] },
-        },
-      ],
-    }).catch(() => undefined);
-    const stamp = `vessel:${key}\n${foodLines}`;
-    const recent =
-      askedHostRef.current.stamp === stamp &&
-      Date.now() - askedHostRef.current.at < 3000;
-    if (recent) return true;
-    askedHostRef.current = { stamp, at: Date.now() };
-    try {
-      await sendMessage(
-        `${foodLines} 밥·국 그릇 지름을 사진 손바닥과 비교해 지금 lookup-meal-portions vesselHints에 넣으세요. 손 폭을 그대로 지름으로 쓰지 마세요. 냄비·팬이면 sharedPot true. note·accountKey는 아래 그대로.
-note:
-${key}
-accountKey=${accountKey}`,
-      );
-      return true;
-    } catch {
-      askedHostRef.current = { stamp: "", at: 0 };
-      stopPoll();
-      setWaiting(false);
-      setFailed(
-        "자동으로 사진 판별 요청을 보내지 못했습니다. 채팅창에 '그릇 지름 확인해 줘'라고 입력하거나 아래에서 그릇 크기를 직접 선택해 주세요.",
-      );
-      return false;
-    }
-  }
-
   async function askHost(key: string) {
     const handLine =
       measuredWidth > 0
         ? `손바닥 폭 ${measuredWidth}cm, 손 길이 ${measuredLength || "?"}cm, 1줌 ${handfulVolumeMl || "?"}ml.`
         : "손 치수 없음(글만·기준 분량 가능).";
+    // Photo+rice/soup: diameter must already be on the card from the first open.
+    // Never tell the host to re-open write-meal-foods (that creates a second card).
     const instruction = textOnly
       ? `사진 없이 글만으로 식사 열량을 계산하라. ${handLine} 음식마다 사용자가 적은 amountNote(1줌, 2장, 3개 등)를 그대로 써라. 줌은 손 1줌 부피다. 그 외 단위는 네가 1단위 g와 개수를 판단해 servingGrams·pieceCount에 넣어라. 양(g)은 인터넷에서 추측하지 마라. cuisine=text. lookup-meal-portions를 호출하라. note:\n${key}\naccountKey=${accountKey}.`
       : meal === "snack"
         ? `간식 포장지(성분표) 사진을 보고 사용자가 적은 단위 1개당 kcal를 읽어라. ${handLine} 먹은 양은 사용자가 적은 amountNote 그대로다. 줌은 저장된 손 1줌 부피고, 장·개·봉지 등은 그 1단위 kcal다. g당으로 넣지 마라. cuisine=snack, role=snack. lookup-meal-portions 호출. note:\n${key}\naccountKey=${accountKey}.`
-        : vesselPhotoGuide(
-          key,
-          drafts
-            .filter((d) => d.role === "rice" || d.role === "soup")
-            .map((d) => d.name)
-            .join(", ") || "밥·국",
-        );
+        : `사진 식사 카드가 이미 열렸다. write-meal-foods를 다시 열지 마라(카드가 두 장 생긴다). 밥·국 지름이 비었으면 사용자가 카드에서 고친다. lookup vesselHints만 넣지 마라. ${handLine}\nnote:\n${key}\naccountKey=${accountKey}.`;
     try {
       void updateModelContext({
         content: [
@@ -1087,56 +1013,19 @@ accountKey=${accountKey}`,
     const nextDrafts =
       drafts.length > 0
         ? drafts
-        : draftsFromNote(note, meal, measuredLength, measuredWidth);
+        : draftsFromHost(hostItems, note, meal, measuredLength, measuredWidth);
     setDrafts(nextDrafts);
     setCuisine(meal === "snack" ? "snack" : textOnly ? "text" : "korean");
     const key = mealPortionKey([{ slot: 1, meal, note: note.trim() }]);
     setFailed("");
-    setNutrition(null);
-    setConfirmed(false);
+    resetFoods();
     setPortionKey(key);
     expectMissingRef.current = false;
     setWebPrompts([]);
     setFoodsAccepted(false);
-    stopPoll();
-    const needDiameter = vesselsNeedPhotoDiameter(nextDrafts).length > 0;
-    setWaiting(needDiameter);
     setHostSawPalm(false);
+    setWaiting(false);
     await askHost(key);
-    if (needDiameter) {
-      const sent = await askHostForVesselDiameter(key, nextDrafts);
-      if (!sent) return;
-    }
-    if (await peekPortion(key)) {
-      setWaiting(false);
-      return;
-    }
-    if (!needDiameter) {
-      setWaiting(false);
-      return;
-    }
-    let tries = 0;
-    pollRef.current = setInterval(() => {
-      tries += 1;
-      void (async () => {
-        await peekPortion(key);
-        const still = vesselsNeedPhotoDiameter(
-          draftsRef.current.length > 0 ? draftsRef.current : nextDrafts,
-        );
-        if (still.length === 0) {
-          stopPoll();
-          setWaiting(false);
-          return;
-        }
-        if (tries >= 30) {
-          stopPoll();
-          setWaiting(false);
-          setFailed(
-            "사진에서 밥·국 그릇 지름을 아직 못 읽었습니다. kcal 계산을 다시 눌러 주세요.",
-          );
-        }
-      })();
-    }, MISSING_POLL_MS);
   }
 
   function readWebPrompts(out: {
@@ -1152,6 +1041,7 @@ accountKey=${accountKey}`,
       const kcal = Number(row.kcalPerUnit) || Number(row.kcalPerBasis) || 0;
       const serving = Number(row.servingGrams) || 0;
       const unit = String(row.unit ?? "").trim() || "개";
+      const per100g = row.per100g === true || unit === "100g";
       const candidates = Array.isArray(row.candidates)
         ? row.candidates.flatMap((entry) => {
           if (!entry || typeof entry !== "object") return [];
@@ -1187,6 +1077,7 @@ accountKey=${accountKey}`,
               fatPerUnit: String(Number(row.fatPerUnit) || 0),
             })),
           servingGrams: serving > 0 ? String(serving) : "",
+          per100g,
           needsCandidatePick,
           candidates,
           selectedPick: "",
@@ -1194,6 +1085,91 @@ accountKey=${accountKey}`,
       ];
     });
     return prompts;
+  }
+
+  /** Prefer server Workers AI draft; host chat follow-up only as fallback. */
+  async function fillMissingWithServerEstimate(
+    prompts: WebPrompt[],
+    list: FoodDraft[],
+    key: string,
+  ): Promise<void> {
+    setWaiting(true);
+    const next = [...prompts];
+    let failedAny = false;
+    for (let index = 0; index < next.length; index += 1) {
+      const prompt = next[index];
+      if (prompt.needsCandidatePick || unitNutritionReady(prompt)) continue;
+      // Rice/soup: per 100 g. Others: exactly one unit (never "2개" → count twice).
+      const unit = prompt.per100g ? "100g" : `1${prompt.unit || "개"}`;
+      try {
+        const result = await estimateUnit({
+          foodName: prompt.query,
+          unit,
+          accountKey,
+        });
+        const out = result.structuredContent as
+          | {
+              kcalPerUnit?: number;
+              carbPerUnit?: number;
+              proteinPerUnit?: number;
+              fatPerUnit?: number;
+              gramsPerUnit?: number;
+              error?: string;
+            }
+          | null
+          | undefined;
+        if (out && Number(out.kcalPerUnit) > 0) {
+          const grams = Number(out.gramsPerUnit) || 0;
+          next[index] = {
+            ...prompt,
+            kcalPerUnit: String(out.kcalPerUnit),
+            carbPerUnit: String(Number(out.carbPerUnit) || 0),
+            proteinPerUnit: String(Number(out.proteinPerUnit) || 0),
+            fatPerUnit: String(Number(out.fatPerUnit) || 0),
+            // 1단위 g (개·장). 줌·100g당은 서버가 손 부피·그릇으로 g을 구한다.
+            servingGrams:
+              !prompt.per100g && prompt.unit !== "줌" && grams > 0
+                ? String(grams)
+                : prompt.servingGrams,
+            webMiss: false,
+          };
+        } else {
+          failedAny = true;
+        }
+      } catch {
+        failedAny = true;
+      }
+    }
+    const nextNames = new Set(next.map((prompt) => prompt.query));
+    setWebPrompts((prev) => [
+      ...prev.filter((prompt) => !nextNames.has(prompt.query)),
+      ...next,
+    ]);
+    setWaiting(false);
+    const stillMissing = next.filter(
+      (prompt) => !prompt.needsCandidatePick && !unitNutritionReady(prompt),
+    );
+    if (stillMissing.length === 0) {
+      expectMissingRef.current = false;
+      setFailed("");
+      return;
+    }
+    if (failedAny) {
+      setFailed(
+        "서버 초안을 일부 못 채웠습니다. 아래에서 직접 입력하거나 다시 계산해 주세요.",
+      );
+      await askHostForMissingKcal(
+        stillMissing
+          .map((prompt) => {
+            const draft = list.find((item) => item.name === prompt.query);
+            const amount =
+              draft?.amountNote.trim() || `1${prompt.unit || "개"}`;
+            return `${prompt.query} ${amount}`;
+          })
+          .join(", "),
+        key,
+      );
+    }
   }
 
   async function askHostForMissingKcal(
@@ -1209,35 +1185,42 @@ accountKey=${accountKey}`,
         },
       ],
     }).catch(() => undefined);
-    const stamp = `${key}\n${lines}`;
-    const recent =
-      askedHostRef.current.stamp === stamp &&
-      Date.now() - askedHostRef.current.at < 3000;
-    if (recent) return;
-    askedHostRef.current = { stamp, at: Date.now() };
-    try {
-      await sendMessage(
-        missingFoodChat(lines, key, accountKey, handfulVolumeMl),
-      );
-    } catch {
-      askedHostRef.current = { stamp: "", at: 0 };
-      setFailed("채팅으로 확인 요청을 보내지 못했습니다. kcal 계산을 다시 눌러 주세요.");
-    }
+    askedHostRef.current = { stamp: `${key}\n${lines}`, at: Date.now() };
+    setFailed(
+      "서버 초안이 부족하면 아래에서 kcal·탄단지를 직접 입력해 주세요.",
+    );
   }
 
-  async function confirmKcal(override?: FoodDraft[]) {
+  /**
+   * One lookup per group. "side" = everything except the rice/soup bowls; it runs
+   * on its own as soon as the card opens. "bowl" = rice/soup only, run by the
+   * 「열량 계산」 button after the bowl and fill are set.
+   */
+  async function confirmKcal(
+    override?: FoodDraft[],
+    group: FoodGroup = "side",
+  ): Promise<void> {
     if (!ready || isPending || saved) return;
-    const list =
+    const all =
       override ??
       (drafts.length > 0
         ? drafts
-        : draftsFromNote(note, meal, measuredLength, measuredWidth));
-    if (list.length === 0) {
+        : draftsFromHost(hostItems, note, meal, measuredLength, measuredWidth));
+    if (all.length === 0) {
       setFailed("음식 이름을 적어 주세요.");
       return;
     }
-    setDrafts(list);
+    if (override || drafts.length === 0) setDrafts(all);
+    const list = all.filter((draft) =>
+      group === "bowl" ? isBowlDraft(draft) : !isBowlDraft(draft),
+    );
+    if (list.length === 0) {
+      // Nothing in this group (e.g. no bowls): it counts as done.
+      setGroupFoods(group, [], all);
+      return;
+    }
     if (
+      group === "side" &&
       needsHand &&
       !(handfulVolumeMl > 0) &&
       list.some((draft) => parseAmountNote(draft.amountNote).handfuls > 0)
@@ -1245,7 +1228,9 @@ accountKey=${accountKey}`,
       setFailed("줌은 반찬 부피라 손 1줌이 있어야 계산됩니다.");
       return;
     }
+    // Only sides need a typed amount; the bowl is measured with the bowl UI.
     if (
+      group === "side" &&
       list.some(
         (draft) =>
           draft.amountMode !== "vessel" && draft.amountNote.trim().length === 0,
@@ -1257,33 +1242,21 @@ accountKey=${accountKey}`,
     const key =
       portionKey || mealPortionKey([{ slot: 1, meal, note: note.trim() }]);
     setPortionKey(key);
-    const needDiameter = vesselsNeedPhotoDiameter(list);
-    if (needDiameter.length > 0) {
-      setFailed("");
-      setWaiting(true);
-      const sent = await askHostForVesselDiameter(key, list);
-      if (!sent) return;
-      stopPoll();
-      const startedAt = Date.now();
-      pollRef.current = setInterval(() => {
-        if (Date.now() - startedAt > MISSING_POLL_MAX_MS) {
-          stopPoll();
-          setWaiting(false);
-          setFailed(
-            "사진에서 밥·국 그릇 지름을 아직 못 읽었습니다. 다시 눌러 주세요.",
-          );
-          return;
-        }
-        void (async () => {
-          await peekPortion(key);
-          if (vesselsNeedPhotoDiameter(draftsRef.current).length === 0) {
-            stopPoll();
-            setWaiting(false);
-            void confirmKcal(draftsRef.current);
-          }
-        })();
-      }, MISSING_POLL_MS);
-      return;
+    if (group === "bowl") {
+      // Photo meals need a diameter (host first-open or user typed). Never re-open the card.
+      const missingDiameter = list.filter(
+        (draft) =>
+          !(draft.vessel.diameterCm > 0) && !(draft.photoDiameterCm > 0),
+      );
+      if (missingDiameter.length > 0) {
+        setFailed(
+          "밥·국 지름을 입력해 주세요. 사진 비교값이 없으면 아래에서 직접 고르세요.",
+        );
+        return;
+      }
+      bowlCalcSigRef.current = bowlSigOf(list);
+    } else {
+      sideCalcSigRef.current = sideSigOf(list);
     }
     setFailed("");
     setWaiting(true);
@@ -1323,6 +1296,7 @@ accountKey=${accountKey}`,
                         ? draft.photoDiameterCm
                         : undefined,
                       hasHostPhoto && !textOnly,
+                      draft.role === "soup" ? "soup" : "rice",
                     )) || undefined
                   : undefined,
               thicknessCm:
@@ -1351,8 +1325,8 @@ accountKey=${accountKey}`,
       if (prompts) {
         dismissedMissRef.current = "";
         setFoodsAccepted(false);
-        setConfirmed(false);
-        setNutrition(null);
+        // This group has no result until its misses are confirmed; the other keeps its own.
+        setGroupFoods(group, null, all);
         setFailed("");
         const pickPrompts = prompts.filter(
           (prompt) => prompt.needsCandidatePick,
@@ -1362,7 +1336,11 @@ accountKey=${accountKey}`,
             !prompt.needsCandidatePick && !unitNutritionReady(prompt),
         );
         expectMissingRef.current = missingNutrition.length > 0;
-        setWebPrompts(prompts);
+        const groupNames = new Set(list.map((draft) => draft.name));
+        setWebPrompts((prev) => [
+          ...prev.filter((prompt) => !groupNames.has(prompt.query)),
+          ...prompts,
+        ]);
         setWaiting(false);
         if (pickPrompts.length > 0 && missingNutrition.length === 0) {
           // List is ready for the user; host may refine order via alsoSearch.
@@ -1375,39 +1353,21 @@ accountKey=${accountKey}`,
               },
             ],
           }).catch(() => undefined);
-          stopPoll();
           return;
         }
         if (missingNutrition.length === 0) {
-          stopPoll();
           return;
         }
-        const lines = missingNutrition
-          .map((prompt) => {
-            const draft = list.find((item) => item.name === prompt.query);
-            const amount =
-              draft?.amountNote.trim() || `1${prompt.unit || "개"}`;
-            return `${prompt.query} ${amount}`;
-          })
-          .join(", ");
-        await askHostForMissingKcal(lines, key);
-        stopPoll();
-        const startedAt = Date.now();
-        pollRef.current = setInterval(() => {
-          if (Date.now() - startedAt > MISSING_POLL_MAX_MS) {
-            stopPoll();
-            return;
-          }
-          void peekPortion(key);
-        }, MISSING_POLL_MS);
+        await fillMissingWithServerEstimate(prompts, list, key);
         return;
       }
-      if (out?.ok && applyPortionFoods(out.foods)) {
-        stopPoll();
+      if (out?.ok && applyPortionFoods(out.foods, group, all)) {
         expectMissingRef.current = false;
         dismissedMissRef.current = "";
-        setWebPrompts([]);
-        setConfirmed(true);
+        const groupNames = new Set(list.map((draft) => draft.name));
+        setWebPrompts((prev) =>
+          prev.filter((prompt) => !groupNames.has(prompt.query)),
+        );
         setWaiting(false);
         return;
       }
@@ -1423,6 +1383,39 @@ accountKey=${accountKey}`,
       setWaiting(false);
     }
   }
+
+  const sideDrafts = drafts.filter((draft) => !isBowlDraft(draft));
+  const bowlDrafts = drafts.filter((draft) => isBowlDraft(draft));
+  const sideKey = sideSigOf(sideDrafts);
+  const bowlKey = bowlSigOf(bowlDrafts);
+  const needsVessel = bowlDrafts.length > 0;
+
+  // 1) Sides: kcal is fixed as soon as the card opens (DB hit, or AI draft on a miss).
+  //    Rice/soup never block this and are not part of this lookup.
+  useEffect(() => {
+    if (saved || waiting || !ready || sideDrafts.length === 0) return;
+    if (
+      sideDrafts.some((draft) => draft.amountNote.trim().length === 0)
+    ) {
+      return;
+    }
+    if (sideCalcSigRef.current === sideKey) return;
+    const timer = window.setTimeout(() => {
+      void confirmKcal(drafts, "side");
+    }, 500);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed by side signature
+  }, [sideKey, ready, saved, waiting]);
+
+  // 2) Bowl changed after a calculation → drop the bowl result (and the total)
+  //    so the old kcal never stays on screen. Sides are kept.
+  useEffect(() => {
+    if (!bowlFoodsRef.current) return;
+    if (bowlCalcSigRef.current === bowlKey) return;
+    bowlCalcSigRef.current = "";
+    setGroupFoods("bowl", null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed by bowl signature
+  }, [bowlKey]);
 
   async function resolvePhoto(photo: MealPhoto): Promise<MealPhoto | undefined> {
     if (!photo.file_id && !photo.download_url) return undefined;
@@ -1444,7 +1437,7 @@ accountKey=${accountKey}`,
     };
   }
 
-  if (!embedded && !toolInfo.isSuccess) {
+  if (!toolInfo.isSuccess) {
     return (
       <div
         className={`${theme === "dark" ? "dark" : ""} min-h-[200px] p-4 bg-background text-foreground`}
@@ -1507,13 +1500,25 @@ accountKey=${accountKey}`,
               proteinG: Number(out.proteinG) || 0,
               fatG: Number(out.fatG) || 0,
               foods: Array.isArray(out.foods)
-                ? out.foods.map((food) => ({
-                  foodName: String(food.foodName ?? ""),
-                  kcal: Number(food.kcal) || 0,
-                  carbG: Number(food.carbG) || 0,
-                  proteinG: Number(food.proteinG) || 0,
-                  fatG: Number(food.fatG) || 0,
-                }))
+                ? out.foods.map((food) => {
+                  const foodName = String(food.foodName ?? "");
+                  const previous = nutrition.foods.find(
+                    (row) =>
+                      row.foodName === foodName ||
+                      row.foodName.includes(foodName) ||
+                      foodName.includes(row.foodName),
+                  );
+                  return {
+                    foodName,
+                    grams: Number(food.grams) || previous?.grams || 0,
+                    kcal: Number(food.kcal) || 0,
+                    carbG: Number(food.carbG) || 0,
+                    proteinG: Number(food.proteinG) || 0,
+                    fatG: Number(food.fatG) || 0,
+                    role: previous?.role,
+                    amountSource: previous?.amountSource,
+                  };
+                })
                 : nutrition.foods,
             });
             setSaved(true);
@@ -1533,197 +1538,86 @@ accountKey=${accountKey}`,
         </div>
 
         <div className="rounded-xl border border-border bg-card p-3 shadow-sm">
-          <p className="mb-1.5 text-xs font-semibold text-muted-foreground">
-            끼니
+          <p className="text-sm font-semibold">{mealLabel[meal]} · 채팅에서 받은 구성</p>
+          <p className="mt-1 whitespace-pre-wrap text-sm text-muted-foreground">
+            {note.trim() || "채팅에 음식명과 양을 보내 주세요."}
           </p>
-          <div className="mb-3 flex flex-wrap gap-1.5">
-            {mealSlots.map((option) => (
-              <button
-                key={option}
-                type="button"
-                disabled={saved}
-                onClick={() => {
-                  setMeal(option);
-                  forgetPortion();
-                  setDrafts([]);
-                }}
-                className={`rounded-lg border px-3 py-1.5 text-sm font-bold disabled:opacity-60 ${meal === option
-                    ? "border-blue-600 bg-blue-600 text-white"
-                    : "border-border bg-background"
-                  }`}
-              >
-                {mealLabel[option]}
-              </button>
-            ))}
-          </div>
-
-          {meal === "snack" ? (
-            <p className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm">
-              과자·포장 간식은 <strong>봉지의 성분표(영양정보)</strong>를 찍어
-              주세요. 먹은 양은 줌 또는 낱개(1/2·1/3 등)로 고릅니다.
-            </p>
-          ) : null}
-
           {picked ? (
-            <PhotoCanvas file={picked} alt="식사/포장지 사진" />
+            <PhotoCanvas file={picked} alt="식사 사진" />
           ) : hostPhoto.file_id || hostPhoto.download_url ? (
             <HostFileImage
               fileId={hostPhoto.file_id}
               downloadUrl={hostPhoto.download_url}
-              alt="식사/포장지 사진"
-              className="mb-3 max-h-52 w-full rounded-lg object-cover"
+              alt="식사 사진"
+              className="mt-3 max-h-52 w-full rounded-lg object-cover"
             />
           ) : null}
-
-          <label className="mb-3 flex cursor-pointer items-center justify-center rounded-lg border border-dashed border-border bg-muted/30 px-3 py-3 text-sm font-medium">
-            {picked || hostPhoto.file_id
-              ? "사진 바꾸기"
-              : meal === "snack"
-                ? "포장지 사진 선택"
-                : "사진 선택 (선택)"}
-            <input
-              type="file"
-              accept="image/*"
-              className="sr-only"
-              disabled={saved}
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                event.target.value = "";
-                if (!file) return;
-                setPicked(file);
-                forgetPortion();
-              }}
-            />
-          </label>
-          {!textOnly && meal !== "snack" && (picked || embedded) && !hasHostPhoto ? (
-            <p className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm">
-              사진으로 그릇 지름을 판별하려면 채팅창에 손바닥과 식단 사진을 함께
-              올려 주세요. 아래에서 그릇 크기를 직접 고르거나 줌으로도 적을 수
-              있습니다.
-            </p>
-          ) : null}
-
-          <label className="block text-sm font-medium">
-            먹은 음식
-            <textarea
-              value={note}
-              maxLength={200}
-              rows={3}
-              placeholder={
-                meal === "snack"
-                  ? "예: 초코파이, 감자칩"
-                  : "예: 공기밥, 된장국, 김치, 계란말이"
-              }
-              disabled={saved}
-              onChange={(event) => {
-                setNote(event.target.value);
-                forgetPortion();
-                setDrafts([]);
-              }}
-              className="mt-1.5 h-20 w-full resize-none overflow-y-auto rounded-lg border border-border bg-background px-3 py-2 text-sm disabled:opacity-60"
-            />
-          </label>
         </div>
-
-        {!hasPhoto && meal !== "snack" ? (
-          <p className="text-xs text-muted-foreground">
-            사진 없음 → 기준 분량(예: 바나나 1개)으로 계산합니다.
-          </p>
-        ) : null}
 
         {drafts.length > 0 ? (
           <div className="space-y-2">
-            <h3 className="text-sm font-bold">먹은 양이 얼마나 되나요</h3>
+            <h3 className="text-sm font-bold">
+              {needsVessel ? "밥·국 그릇 맞추기" : "채팅에서 받은 구성"}
+            </h3>
             <p className="text-xs leading-relaxed text-muted-foreground">
-              {textOnly
-                ? "사진 없음 → 예: 밥 1공기, 김치 1줌, 바나나 1개처럼 단위와 함께 적으세요."
-                : "줌은 반찬의 부피를 나타낼 수 있습니다. 장, 개, 봉지처럼 다른 단위는 그대로 적으면 됩니다. 적은 단위는 확인 때 판단합니다."}
+              반찬 열량은 카드가 열리면 바로 계산됩니다. 밥·국은 사진 손바닥
+              비교 지름(없으면 직접 입력)과 100g당 열량만 보이고, 그릇·높이를
+              맞춘 뒤 「열량 계산」을 누르면 부피×밀도로 g이 정해져 총 kcal가
+              나옵니다. 부피를 다시 바꾸면 버튼을 한 번 더 누르세요.
             </p>
-            {!textOnly && meal !== "snack" ? (
-              <div className="mb-1 flex gap-1">
-                {(["korean", "western"] as const).map((option) => (
-                  <button
-                    key={option}
-                    type="button"
-                    disabled={saved}
-                    onClick={() => setCuisine(option)}
-                    className={`rounded-md border px-2 py-1 text-xs font-bold ${cuisine === option
-                        ? "border-blue-600 bg-blue-600 text-white"
-                        : "border-border"
-                      }`}
-                  >
-                    {option === "korean" ? "한식" : "양식"}
-                  </button>
-                ))}
-              </div>
-            ) : null}
-            {drafts.map((draft, index) => (
+            {drafts.map((draft, index) => {
+              const isBowl = isBowlDraft(draft);
+              // Each group shows only its own result, matched by the typed name.
+              const computed = (isBowl ? bowlFoods : sideFoods)?.find((food) =>
+                foodMatchesDraft(food, draft),
+              );
+              const per100 = densityLabel(draft.kcalPer100g);
+              const showTotal = Boolean(computed);
+              return (
               <div
                 key={`${draft.name}-${index}`}
                 className="rounded-lg border border-border p-2"
               >
                 <p className="text-sm font-semibold">
                   {roleLabel[draft.role] ?? draft.role} · {draft.name}
+                  {!isBowl ? (
+                    <span className="ml-2 font-normal text-muted-foreground">
+                      {draft.amountNote ? `${draft.amountNote} · ` : ""}
+                      {showTotal
+                        ? `${computed!.grams ?? 0}g · ${computed!.kcal}kcal`
+                        : waiting
+                          ? "열량 확인 중…"
+                          : per100 || "열량 확인 필요"}
+                    </span>
+                  ) : (
+                    <span className="ml-2 font-normal text-muted-foreground">
+                      {showTotal
+                        ? `${computed!.grams ?? 0}g · ${computed!.kcal}kcal`
+                        : per100 || "100g당 열량 대기"}
+                    </span>
+                  )}
                 </p>
-                {(draft.role === "rice" || draft.role === "soup") &&
-                  !textOnly ? (
-                  <div className="mt-2 flex gap-2">
-                    {(
-                      [
-                        ["vessel", "개인 그릇"],
-                        ["text", "냄비·팬 → 줌"],
-                      ] as const
-                    ).map(([mode, label]) => (
-                      <button
-                        key={mode}
-                        type="button"
-                        disabled={saved}
-                        onClick={() => {
-                          const next = [...drafts];
-                          next[index] = {
-                            ...draft,
-                            amountMode: mode,
-                            sharedPot: mode === "text",
-                            amountNote:
-                              mode === "text" ? draft.amountNote : draft.amountNote,
-                          };
-                          setDrafts(next);
-                          setConfirmed(false);
-                        }}
-                        className={`rounded-full border px-3 py-1 text-xs font-semibold ${(mode === "vessel" && draft.amountMode === "vessel") ||
-                            (mode === "text" && draft.amountMode !== "vessel")
-                            ? "border-blue-600 bg-blue-600 text-white"
-                            : "border-border"
-                          }`}
-                      >
-                        {label}
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
-                {draft.sharedPot && draft.amountMode !== "vessel" ? (
-                  <p className="mt-2 text-xs text-amber-800 dark:text-amber-200">
-                    냄비·팬처럼 같이 먹는 그릇이면, 먹은 양만 손 1줌
-                    {handfulVolumeMl > 0 ? `(${handfulVolumeMl}ml)` : ""} 기준으로
-                    적어 주세요.
-                  </p>
-                ) : null}
-                {draft.amountMode === "vessel" && !textOnly ? (
+                {isBowl ? (
                   <div className="mt-2">
                     <MealVesselControls
                       handLengthCm={measuredLength}
                       handWidthCm={measuredWidth}
                       requirePhotoDiameter={hasHostPhoto && !textOnly}
+                      awaitingPhotoCompare={
+                        hasHostPhoto &&
+                        !textOnly &&
+                        !(draft.photoDiameterCm > 0) &&
+                        !(draft.vessel.diameterCm > 0)
+                      }
+                      bowlRole={draft.role === "soup" ? "soup" : "rice"}
                       photoDiameterCm={
                         draft.photoDiameterCm > 0
                           ? draft.photoDiameterCm
                           : undefined
                       }
                       value={draft.vessel}
-                      label={draft.role === "soup" ? "국" : draft.role === "rice" ? "밥" : "그릇"}
-                      askSharedBowl={
-                        draft.role === "rice" || draft.role === "soup"
-                      }
+                      label={draft.role === "soup" ? "국" : "밥"}
+                      askSharedBowl={false}
                       onChange={(vessel) => {
                         const diameterEdited =
                           Math.abs(vessel.diameterCm - draft.vessel.diameterCm) >
@@ -1738,52 +1632,33 @@ accountKey=${accountKey}`,
                               : draft.photoDiameterCm,
                         };
                         setDrafts(next);
-                        setConfirmed(false);
+                        // Any volume edit clears only the bowl result (see bowl effect); sides stay.
                       }}
                     />
                   </div>
-                ) : (
-                  <div className="mt-2">
-                    <label className="block text-sm font-medium">
-                      양
-                      <input
-                        type="text"
-                        value={draft.amountNote}
-                        placeholder={
-                          draft.sharedPot || draft.role === "rice" || draft.role === "soup"
-                            ? "예: 1줌, 1.5줌"
-                            : textOnly
-                              ? "예: 1공기, 1줌, 2장, 1개"
-                              : "예: 1줌, 2장, 3개"
-                        }
-                        disabled={saved}
-                        onChange={(event) => {
-                          const next = [...drafts];
-                          next[index] = {
-                            ...draft,
-                            amountNote: event.target.value,
-                            amountMode:
-                              draft.amountMode === "vessel"
-                                ? "text"
-                                : draft.amountMode,
-                          };
-                          setDrafts(next);
-                          setConfirmed(false);
-                        }}
-                        className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2"
-                      />
-                    </label>
-                  </div>
-                )}
+                ) : null}
               </div>
-            ))}
+              );
+            })}
+            {needsVessel && bowlFoods === null && !saved ? (
+              <button
+                type="button"
+                className="w-full rounded-xl bg-blue-600 py-3 text-sm font-bold text-white disabled:opacity-60"
+                disabled={waiting || isPending}
+                onClick={() => {
+                  void confirmKcal(drafts, "bowl");
+                }}
+              >
+                {waiting ? "열량 계산 중…" : "이 그릇으로 열량 계산"}
+              </button>
+            ) : null}
           </div>
         ) : null}
 
-        {nutrition ? (
+        {nutrition && (confirmed || saved) ? (
           <div className="rounded-xl border border-border bg-card p-3">
             <p className="text-sm text-muted-foreground">
-              {saved ? "저장한 칼로리" : confirmed ? "확정 칼로리" : "미리보기"}
+              {saved ? "저장한 칼로리" : "확정 칼로리"}
             </p>
             <p className="text-3xl font-bold">
               {nutrition.kcal}
@@ -1802,29 +1677,30 @@ accountKey=${accountKey}`,
                 </li>
               ))}
             </ul>
-            <div className="mt-3 h-40 w-full">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart
-                  data={[
-                    { name: "탄수화물", grams: nutrition.carbG, fill: "#f59e0b" },
-                    { name: "단백질", grams: nutrition.proteinG, fill: "#16a34a" },
-                    { name: "지방", grams: nutrition.fatG, fill: "#2563eb" },
-                  ]}
-                >
-                  <XAxis dataKey="name" tick={{ fontSize: 12 }} />
-                  <YAxis width={36} unit="g" tick={{ fontSize: 11 }} />
-                  <Bar dataKey="grams" radius={[6, 6, 0, 0]}>
-                    {[
-                      { fill: "#f59e0b" },
-                      { fill: "#16a34a" },
-                      { fill: "#2563eb" },
-                    ].map((row, index) => (
-                      <Cell key={index} fill={row.fill} />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
+            {saved ? (
+              <div className="mt-3 h-40 w-full">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart
+                    data={[
+                      { name: "총열량", kcal: nutrition.kcal, fill: "#0f766e" },
+                      { name: "탄수화물", kcal: nutrition.carbG * 4, fill: "#f59e0b" },
+                      { name: "단백질", kcal: nutrition.proteinG * 4, fill: "#16a34a" },
+                      { name: "지방", kcal: nutrition.fatG * 9, fill: "#2563eb" },
+                    ]}
+                  >
+                    <XAxis dataKey="name" tick={{ fontSize: 11 }} />
+                    <YAxis width={40} unit="kcal" tick={{ fontSize: 11 }} />
+                    <Bar dataKey="kcal" radius={[6, 6, 0, 0]}>
+                      {["#0f766e", "#f59e0b", "#16a34a", "#2563eb"].map(
+                        (fill, index) => (
+                          <Cell key={index} fill={fill} />
+                        ),
+                      )}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            ) : null}
           </div>
         ) : null}
 
@@ -1834,6 +1710,7 @@ accountKey=${accountKey}`,
               등록 완료
             </p>
             <p className="text-muted-foreground">{summary}</p>
+            <ChatNextHint example="오늘 목표 달성 보여줘" />
           </div>
         ) : null}
 
@@ -1869,8 +1746,7 @@ accountKey=${accountKey}`,
                 dismissedMissRef.current = portionKey;
                 expectMissingRef.current = false;
                 askedHostRef.current = { stamp: "", at: 0 };
-                stopPoll();
-                setWebPrompts([]);
+                      setWebPrompts([]);
                 setFoodsAccepted(false);
                 setFailed("");
               }}
@@ -1962,7 +1838,7 @@ accountKey=${accountKey}`,
                   />
                 </label>
                 <label className="block text-xs">
-                  1{unit}당 kcal
+                  {prompt.per100g ? "100g당" : `1${unit}당`} kcal
                   {unit === "줌" && handfulVolumeMl
                     ? ` · 손 1줌 ${handfulVolumeMl}ml`
                     : ""}
@@ -2029,17 +1905,6 @@ accountKey=${accountKey}`,
               </div>
             );
           })}
-          {webPrompts.some((prompt) => !prompt.needsCandidatePick) ? (
-            <button
-              type="button"
-              className="w-full rounded-lg border border-border py-2 text-xs font-semibold"
-              onClick={() => {
-                void peekPortion(portionKey);
-              }}
-            >
-              AI 답이 왔는지 확인
-            </button>
-          ) : null}
           <button
             type="button"
             className="w-full rounded-xl border border-blue-600 py-3 text-sm font-bold text-blue-700 disabled:opacity-60 dark:text-blue-300"
@@ -2085,12 +1950,29 @@ accountKey=${accountKey}`,
                 }
                 const kcal = Number(prompt.kcalPerUnit);
                 const serving = Number(prompt.servingGrams);
-                return {
+                const common = {
                   ...draft,
                   nameConfirmed: true,
                   noneOfCandidates: true,
                   candidateName: prompt.candidateName.trim() || draft.name,
                   matchedFoodName: "",
+                };
+                // Rice/soup: the draft holds per-100 g values; the server multiplies by bowl grams.
+                if (prompt.per100g) {
+                  return {
+                    ...common,
+                    kcalPer100g: kcal,
+                    carbPer100g: Number(prompt.carbPerUnit) || 0,
+                    proteinPer100g: Number(prompt.proteinPerUnit) || 0,
+                    fatPer100g: Number(prompt.fatPerUnit) || 0,
+                    kcalPerUnit: 0,
+                    carbPerUnit: 0,
+                    proteinPerUnit: 0,
+                    fatPerUnit: 0,
+                  };
+                }
+                return {
+                  ...common,
                   kcalPerUnit: kcal,
                   carbPerUnit: Number(prompt.carbPerUnit) || 0,
                   proteinPerUnit: Number(prompt.proteinPerUnit) || 0,
@@ -2099,33 +1981,20 @@ accountKey=${accountKey}`,
                 };
               });
               setDrafts(next);
-              const needsAi = webPrompts.some(
-                (prompt) =>
-                  prompt.needsCandidatePick &&
-                  prompt.selectedPick === "__none__",
-              );
-              if (needsAi) {
-                setFoodsAccepted(false);
-                setWebPrompts([]);
-                setFailed("");
-                void confirmKcal(next);
-                return;
+              // Re-run only the group(s) that had a pending miss/pick, sides and bowls separately.
+              const groups = new Set<FoodGroup>();
+              for (const prompt of webPrompts) {
+                const target = next.find((draft) => draft.name === prompt.query);
+                if (target) groups.add(isBowlDraft(target) ? "bowl" : "side");
               }
-              const onlyDbPicks = webPrompts.every(
-                (prompt) =>
-                  prompt.needsCandidatePick &&
-                  prompt.selectedPick &&
-                  prompt.selectedPick !== "__none__",
-              );
-              if (onlyDbPicks) {
-                setFoodsAccepted(false);
-                setWebPrompts([]);
-                setFailed("");
-                void confirmKcal(next);
-                return;
-              }
-              setFoodsAccepted(true);
+              setFoodsAccepted(false);
+              setWebPrompts([]);
               setFailed("");
+              void (async () => {
+                for (const target of groups) {
+                  await confirmKcal(next, target);
+                }
+              })();
             }}
           >
             {foodsAccepted
@@ -2159,7 +2028,13 @@ accountKey=${accountKey}`,
                 disabled={!ready || isPending || saved || waiting}
                 onClick={() => {
                   setDrafts(
-                    draftsFromNote(note, meal, measuredLength, measuredWidth),
+                    draftsFromHost(
+                      hostItems,
+                      note,
+                      meal,
+                      measuredLength,
+                      measuredWidth,
+                    ),
                   );
                   void startClassify();
                 }}
@@ -2169,35 +2044,20 @@ accountKey=${accountKey}`,
               </button>
             ) : (
               <button
-                type="button"
+                type="submit"
                 disabled={
                   !ready ||
                   isPending ||
                   saved ||
                   waiting ||
-                  (webPrompts.length > 0 && !foodsAccepted)
+                  (webPrompts.length > 0 && !foodsAccepted) ||
+                  !estimated
                 }
-                onClick={() => {
-                  void confirmKcal();
-                }}
                 className="w-full rounded-xl bg-blue-600 py-3.5 text-base font-bold text-white disabled:opacity-60"
               >
-                {waiting
-                  ? "계산 중…"
-                  : estimated
-                    ? "kcal계산 다시하기"
-                    : "kcal 계산"}
+                {saved ? "등록했습니다" : isPending || waiting ? "저장 중…" : "저장"}
               </button>
             )}
-            {estimated ? (
-              <button
-                type="submit"
-                disabled={!ready || isPending || saved || waiting}
-                className="w-full rounded-xl border border-blue-600 py-3.5 text-base font-bold text-blue-700 disabled:opacity-60 dark:text-blue-300"
-              >
-                {saved ? "등록했습니다" : isPending ? "저장 중…" : "저장"}
-              </button>
-            ) : null}
           </div>
         ) : (
           <button
@@ -2205,7 +2065,13 @@ accountKey=${accountKey}`,
             disabled={!ready || isPending || saved}
             onClick={() => {
               setDrafts(
-                draftsFromNote(note, meal, measuredLength, measuredWidth),
+                draftsFromHost(
+                  hostItems,
+                  note,
+                  meal,
+                  measuredLength,
+                  measuredWidth,
+                ),
               );
             }}
             className="w-full rounded-xl bg-blue-600 py-3.5 text-base font-bold text-white disabled:opacity-60"

@@ -14,7 +14,7 @@ import {
   type WorkoutTimerMode,
 } from "./inbody-analyzer.js";
 import type { TargetBodyType } from "./body-goals.js";
-import { addDays } from "./db/client.js";
+import { addDays } from "./civil-date.js";
 import {
   buildWeekCalendar,
   dateInSameWeek,
@@ -124,6 +124,10 @@ export function weekPlanFingerprint(input: {
   muscleCoreKg: number;
   muscleLowerLeftKg: number;
   muscleLowerRightKg: number;
+  heightCm?: number | null;
+  sex?: string | null;
+  ecwRatio?: number | null;
+  visceralFatLevel?: number | null;
   catalogSlugs: string[];
 }): string {
   const injured = [...input.injuredParts].sort().join(",");
@@ -141,6 +145,10 @@ export function weekPlanFingerprint(input: {
     input.muscleCoreKg,
     input.muscleLowerLeftKg,
     input.muscleLowerRightKg,
+    input.heightCm ?? "",
+    input.sex ?? "",
+    input.ecwRatio ?? "",
+    input.visceralFatLevel ?? "",
     catalog,
   ].join("|");
 }
@@ -159,8 +167,25 @@ export function weekPlanHasGaps(plan: WeekPlanPayload): boolean {
   return plan.days.some((day) => (day.missingSlots?.length ?? 0) > 0);
 }
 
-type Snapshot = Parameters<typeof analyzeInbodyWorkout>[0];
-type Catalog = Parameters<typeof analyzeInbodyWorkout>[1];
+/** Deep clone for card-local draft editing. */
+export function cloneWeekPlan(plan: WeekPlanPayload): WeekPlanPayload {
+  return JSON.parse(JSON.stringify(plan)) as WeekPlanPayload;
+}
+
+/** Dirty check: marks + exercise slugs per day. */
+export function weekPlanDirtyKey(plan: WeekPlanPayload): string {
+  return plan.days
+    .map(
+      (day) =>
+        `${day.date}:${day.mark}:${(day.exercises ?? [])
+          .map((item) => item.slug)
+          .join(",")}`,
+    )
+    .join("|");
+}
+
+export type Snapshot = Parameters<typeof analyzeInbodyWorkout>[0];
+export type Catalog = Parameters<typeof analyzeInbodyWorkout>[1];
 
 function restDayFromSlot(
   date: string,
@@ -183,6 +208,66 @@ function restDayFromSlot(
     missingSlots: [],
     exercises: [],
     energy: null,
+  };
+}
+
+/** Turn a draft day into rest (O → X). Keeps templateKind for later O flip. */
+export function asRestWeekDay(day: WeekPlanDay): WeekPlanDay {
+  return {
+    ...day,
+    mark: "X",
+    kind: "rest",
+    sessionLabel: "휴식",
+    sessionKind: "rest",
+    sessionFocus: "full",
+    recommendedMode: "rest_timer",
+    recommendedIntensity: 1,
+    prescription: null,
+    safetyNotes: [],
+    missingSlots: [],
+    exercises: [],
+    energy: null,
+  };
+}
+
+/** Fill a training day (X → O) with analyzeInbodyWorkout for that date. */
+export function fillTrainingWeekDay(input: {
+  day: WeekPlanDay;
+  snapshot: Snapshot;
+  catalog: Catalog;
+  targetBodyType: TargetBodyType | null;
+  injuredParts: InjuredPart[];
+  e1RmByExercise: Record<string, number>;
+  trainingVenue: TrainingVenue;
+  homeEquipment: HomeEquipment[];
+  recentExerciseNames: string[];
+  targetDays: number | null;
+}): WeekPlanDay {
+  const dayPlan = analyzeInbodyWorkout(input.snapshot, input.catalog, {
+    targetBodyType: input.targetBodyType,
+    injuredParts: input.injuredParts,
+    e1RmByExercise: input.e1RmByExercise,
+    trainingVenue: input.trainingVenue,
+    date: input.day.date,
+    recentExerciseNames: input.recentExerciseNames,
+    homeEquipment: input.homeEquipment,
+    targetDays: input.targetDays,
+  });
+  return {
+    ...input.day,
+    mark: "O",
+    kind: input.day.templateKind,
+    sessionLabel:
+      dayPlan.sessionLabel || sessionKindLabel[input.day.templateKind],
+    sessionKind: dayPlan.sessionKind,
+    sessionFocus: dayPlan.sessionFocus,
+    recommendedMode: dayPlan.recommendedMode,
+    recommendedIntensity: dayPlan.recommendedIntensity,
+    prescription: dayPlan.prescription,
+    safetyNotes: dayPlan.safetyNotes,
+    missingSlots: dayPlan.missingSlots,
+    exercises: dayPlan.exercises,
+    energy: dayPlan.energy,
   };
 }
 

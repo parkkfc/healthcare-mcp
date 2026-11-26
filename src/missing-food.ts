@@ -55,7 +55,10 @@ export function nutritionForOneUnit(input: {
   const basis = basisAmount(input.basis);
   const perMl = /ml/i.test(input.basis);
   let amount = 0;
-  if (input.unit === "줌") {
+  if (input.unit === "100g") {
+    // Rice/soup bowl: the card asks for kcal per 100 g, then volume × density → g.
+    amount = 100;
+  } else if (input.unit === "줌") {
     const ml = input.handfulVolumeMl ?? 0;
     if (!(ml > 0)) return null;
     amount = perMl ? ml : ml * (input.density ?? 1);

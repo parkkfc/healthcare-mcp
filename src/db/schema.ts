@@ -82,6 +82,10 @@ export const users = sqliteTable(
   muscleCoreKg: real("muscle_core_kg"),
   muscleLowerLeftKg: real("muscle_lower_left_kg"),
   muscleLowerRightKg: real("muscle_lower_right_kg"),
+  /** InBody ECW/TBW. Used for recover-only workout gates. */
+  ecwRatio: real("ecw_ratio"),
+  /** InBody visceral fat level (VFL). C-shape + VFL≥10 avoids day-1 HIIT. */
+  visceralFatLevel: integer("visceral_fat_level"),
   heightCm: real("height_cm"),
   sex: text("sex", { enum: sexes }),
   goalKcal: real("goal_kcal"),
@@ -121,6 +125,8 @@ export const inbodyReadings = sqliteTable(
     muscleCoreKg: real("muscle_core_kg").notNull(),
     muscleLowerLeftKg: real("muscle_lower_left_kg").notNull(),
     muscleLowerRightKg: real("muscle_lower_right_kg").notNull(),
+    ecwRatio: real("ecw_ratio"),
+    visceralFatLevel: integer("visceral_fat_level"),
     createdAt: text("created_at").notNull(),
   },
   (table) => [
@@ -240,16 +246,6 @@ export const pendingWorkoutBurns = sqliteTable("pending_workout_burns", {
   sets: integer("sets").notNull().default(0),
   durationMin: real("duration_min").notNull().default(0),
   distanceKm: real("distance_km").notNull().default(0),
-  updatedAt: text("updated_at").notNull(),
-});
-
-/** Host palm / 1-meal portion estimate waiting for the meal card. */
-export const pendingMealPortions = sqliteTable("pending_meal_portions", {
-  userId: text("user_id").primaryKey(),
-  /** Exact slot key the card is waiting on. */
-  note: text("note").notNull().default(""),
-  foodsJson: text("foods_json").notNull().default("[]"),
-  palmComparison: text("palm_comparison").notNull().default(""),
   updatedAt: text("updated_at").notNull(),
 });
 

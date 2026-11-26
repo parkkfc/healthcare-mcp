@@ -29,7 +29,10 @@
 			"bucket_name": "healthcare-mcp-images"
 		}
 	],
-	// Workers AI 바인딩 제거: 음식 kcal 추정은 호스트 LLM(estimate-food-kcal).
+	// 텍스트만: DB미스 1단위 kcal·탄단지 초안(estimate-unit-nutrition). 비전 금지.
+	"ai": {
+		"binding": "AI"
+	},
 	// Workers에는 디스크가 없어서 위젯 JS/CSS를 정적으로 연다.
 	// dist/assets/_redirects가 /assets/assets/* 요청을 /assets/* 파일로 되돌린다.
 	"assets": {

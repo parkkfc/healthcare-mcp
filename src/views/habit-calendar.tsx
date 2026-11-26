@@ -14,7 +14,7 @@ import wellDoneSticker from "@/widgets/참잘했어요.png";
 import {
   HabitGrowthTree,
   resolveHabitGrowth,
-} from "./habit-growth-tree.js";
+} from "./components/habit-growth-tree.js";
 
 export type HabitCalendarData = Extract<
   ReturnType<typeof useToolInfo<"show-habit-calendar">>,

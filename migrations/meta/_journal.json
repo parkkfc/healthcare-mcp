@@ -260,6 +260,34 @@
       "when": 1795079262664,
       "tag": "0036_eager_old_lace",
       "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "6",
+      "when": 1795084000000,
+      "tag": "0037_inbody-ecw-vfl",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "6",
+      "when": 1795160000000,
+      "tag": "0038_drop-pending-meal-portions",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "6",
+      "when": 1795498951296,
+      "tag": "0039_sad_psynapse",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "6",
+      "when": 1795600000000,
+      "tag": "0040_calf-raise-exercises",
+      "breakpoints": true
     }
   ]
 }

@@ -41,7 +41,7 @@ export function BarcodeScanPanel({
   const { callToolAsync: lookup, isPending: looking } =
     useCallTool("lookup-barcode");
   const { callToolAsync: saveFoods, isPending: saving } =
-    useCallTool("save-meal-foods");
+    useCallTool("record-meal-photos");
   const [cameraOn, setCameraOn] = useState(false);
   const [digits, setDigits] = useState("");
   const [product, setProduct] = useState<BarcodeProduct | null>(null);
@@ -147,10 +147,25 @@ export function BarcodeScanPanel({
       const result = await saveFoods({
         meal,
         date,
-        foods: [{ foodName: product.productName, grams, ...eaten }],
+        entries: [
+          {
+            meal,
+            note: product.productName,
+            foods: [
+              {
+                foodName: product.productName,
+                grams,
+                kcal: eaten.kcal,
+                carbG: eaten.carbG,
+                proteinG: eaten.proteinG,
+                fatG: eaten.fatG,
+              },
+            ],
+          },
+        ],
         accountKey,
       });
-      if (result.structuredContent) {
+      if (result.structuredContent?.ok) {
         setSaved(
           `${date} ${mealOptions.find((item) => item.id === meal)?.label ?? ""}에 ${product.productName} ${grams}g, ${eaten.kcal}kcal를 저장했습니다.`,
         );

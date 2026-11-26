@@ -8,7 +8,7 @@ import {
   useUser,
 } from "skybridge/web";
 import { useCallTool, useToolInfo } from "@/helpers.js";
-import { bumpProfile } from "./profile-sync.js";
+import { bumpProfile } from "../hooks/profile-sync.js";
 import { useAccountKey } from "./use-account-key.js";
 import { useClaimConversationKey } from "./use-claim-conversation-key.js";
 

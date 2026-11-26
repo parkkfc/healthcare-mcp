@@ -1,3 +1,4 @@
+import { resolveFoodDensityGPerMl } from "./food-density.js";
 import { gramsFromHandfuls } from "./handful.js";
 import { bowlContentMl } from "./volume.js";
 
@@ -11,6 +12,29 @@ export type MealPortionRole =
   | "snack";
 
 export type MealCuisine = "korean" | "western" | "snack" | "text";
+
+const MEAL_PORTION_ROLES: MealPortionRole[] = [
+  "main",
+  "side",
+  "soup",
+  "rice",
+  "meat",
+  "fried",
+  "snack",
+];
+
+/** Host-supplied role only. Unknown → side (never guess soup from the name). */
+export function coerceMealPortionRole(
+  role: string | undefined | null,
+): MealPortionRole {
+  if (
+    typeof role === "string" &&
+    MEAL_PORTION_ROLES.includes(role as MealPortionRole)
+  ) {
+    return role as MealPortionRole;
+  }
+  return "side";
+}
 
 export type PortionRequest = {
   slot: number;
@@ -36,6 +60,10 @@ export type PortionRequest = {
   servingGrams?: number;
   servingKcal?: number;
   kcalPer100g?: number;
+  /** Rice/soup DB miss: macros per 100 g (with kcalPer100g × bowl grams). */
+  carbPer100g?: number;
+  proteinPer100g?: number;
+  fatPer100g?: number;
   /** kcal of one user unit (1줌 or 1장). Not per gram. */
   kcalPerUnit?: number;
   carbPerUnit?: number;
@@ -160,6 +188,36 @@ export function parseAmountNote(raw: string | undefined): {
   };
 }
 
+/** Rice/soup in a bowl (not text-only, not snack). DB miss uses kcal per 100 g. */
+export function isVesselBowlRequest(
+  request: Pick<PortionRequest, "role" | "cuisine">,
+): boolean {
+  return (
+    (request.role === "rice" || request.role === "soup") &&
+    request.cuisine !== "text" &&
+    request.cuisine !== "snack"
+  );
+}
+
+/** Rice/soup miss confirmed with kcal and at least one macro per 100 g. */
+export function bowlPer100Ready(
+  request: Pick<
+    PortionRequest,
+    "kcalPer100g" | "carbPer100g" | "proteinPer100g" | "fatPer100g"
+  >,
+): boolean {
+  return (
+    (request.kcalPer100g ?? 0) > 0 &&
+    (request.carbPer100g ?? 0) +
+      (request.proteinPer100g ?? 0) +
+      (request.fatPer100g ?? 0) >
+      0
+  );
+}
+
+/** Used only when a missing food has kcalPerUnit but no 1-unit grams. */
+const UNIT_FALLBACK_GRAMS = 100;
+
 /**
  * Resolve eaten grams from card inputs.
  * Korean: rice/soup = bowl. Other foods use the user's amount text.
@@ -175,7 +233,11 @@ export function resolvePortionGrams(
   const name = food.name.trim() || "음식";
   const cuisine = food.cuisine ?? "korean";
   const role = food.role;
-  const density = food.densityGPerMl ?? 1;
+  // Prefer host/card density only when set; else banchan-aware bulk density (not water 1.0).
+  const density =
+    typeof food.densityGPerMl === "number" && food.densityGPerMl > 0
+      ? food.densityGPerMl
+      : resolveFoodDensityGPerMl(name, role);
 
   if (
     cuisine === "text" ||
@@ -228,10 +290,11 @@ export function resolvePortionGrams(
       };
     }
     if (pieces > 0 && (food.kcalPerUnit ?? 0) > 0 && food.nameConfirmed) {
+      // 1단위 g를 모르면 DB 기준(100g)을 1단위로 가정한다. 개수(예 2개→2g)로 저장하지 않는다.
       return {
         ok: true,
-        grams: Math.max(1, pieces),
-        amountSource: noted.label || `${pieces}${noted.unit || "개"}`,
+        grams: Math.max(1, Math.round(pieces * UNIT_FALLBACK_GRAMS)),
+        amountSource: `${noted.label || `${pieces}${noted.unit || "개"}`} (1단위 약 ${UNIT_FALLBACK_GRAMS}g 가정)`,
       };
     }
     return {
@@ -278,10 +341,11 @@ export function resolvePortionGrams(
       };
     }
     if (pieces > 0 && (food.kcalPerUnit ?? 0) > 0 && food.nameConfirmed) {
+      // 1단위 g를 모르면 DB 기준(100g)을 1단위로 가정한다. 개수(예 2개→2g)로 저장하지 않는다.
       return {
         ok: true,
-        grams: Math.max(1, pieces),
-        amountSource: noted.label || `${pieces}${noted.unit || "개"}`,
+        grams: Math.max(1, Math.round(pieces * UNIT_FALLBACK_GRAMS)),
+        amountSource: `${noted.label || `${pieces}${noted.unit || "개"}`} (1단위 약 ${UNIT_FALLBACK_GRAMS}g 가정)`,
       };
     }
     if (pieces > 0) {
@@ -385,6 +449,10 @@ export function finalizePortionEnergy(input: {
   volumeGrams: number;
   servingKcal?: number;
   kcalPer100g?: number;
+  /** Rice/soup DB miss macros per 100 g. */
+  carbPer100g?: number;
+  proteinPer100g?: number;
+  fatPer100g?: number;
   /** How many user units were eaten (줌 횟수, 장 수). */
   unitCount?: number;
   unitLabel?: string;
@@ -431,6 +499,11 @@ export function finalizePortionEnergy(input: {
     input.cuisine === "western" ||
     (input.role === "main" && requestServing > 0);
 
+  const isVesselBowl =
+    (input.role === "rice" || input.role === "soup") &&
+    input.cuisine !== "text" &&
+    input.cuisine !== "snack";
+
   let grams = input.lookup.grams > 0 ? input.lookup.grams : input.volumeGrams;
   let kcal = input.lookup.kcal;
   let carbG = input.lookup.carbG;
@@ -454,6 +527,19 @@ export function finalizePortionEnergy(input: {
   } else if (western && servingKcal > 0 && !(kcalPer100g > 0)) {
     kcal = Math.round(servingKcal);
     amountSource = "1인분 kcal";
+  } else if (
+    !input.lookup.matched &&
+    isVesselBowl &&
+    requestKcalPer100 > 0 &&
+    input.volumeGrams > 0
+  ) {
+    // Rice/soup DB miss: bowl volume × density → g, then g × kcal per 100 g (not 1공기 × unit kcal).
+    grams = Math.max(1, Math.round(input.volumeGrams));
+    kcal = Math.round((grams * requestKcalPer100) / 100);
+    carbG = scaleMacro(input.carbPer100g ?? 0, grams / 100);
+    proteinG = scaleMacro(input.proteinPer100g ?? 0, grams / 100);
+    fatG = scaleMacro(input.fatPer100g ?? 0, grams / 100);
+    amountSource = "그릇 부피 × 100g당 열량";
   } else if (!input.lookup.matched && (input.kcalPerUnit ?? 0) > 0 && (input.unitCount ?? 0) > 0) {
     const count = input.unitCount ?? 0;
     grams = Math.max(1, Math.round(input.volumeGrams > 0 ? input.volumeGrams : grams));

@@ -3,9 +3,9 @@ import "@/index.css";
 import { useEffect, useState } from "react";
 import { useSendFollowUpMessage, useUser } from "skybridge/web";
 import { useCallTool, useToolInfo } from "@/helpers.js";
-import { bumpProfile } from "./profile-sync.js";
+import { bumpProfile } from "../hooks/profile-sync.js";
 import { useAccountKey } from "./use-account-key.js";
-import { useAssistantContext } from "./use-assistant-context.js";
+import { useAssistantContext } from "../hooks/use-assistant-context.js";
 
 export default function SetDisplayName() {
   const { theme } = useUser();

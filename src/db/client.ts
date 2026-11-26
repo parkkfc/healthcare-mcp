@@ -2,22 +2,7 @@ import { and, asc, desc, eq, gte, lte } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import * as schema from "./schema.js";
 
-export function seoulToday(): string {
-  return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Seoul" });
-}
-
-/** Inclusive day gap between YYYY-MM-DD strings (UTC date math). */
-export function daysBetween(from: string, to: string): number {
-  const a = Date.parse(`${from}T00:00:00Z`);
-  const b = Date.parse(`${to}T00:00:00Z`);
-  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
-  return Math.round((b - a) / 86_400_000);
-}
-
-export function addDays(date: string, days: number): string {
-  const ms = Date.parse(`${date}T00:00:00Z`) + days * 86_400_000;
-  return new Date(ms).toISOString().slice(0, 10);
-}
+export { addDays, daysBetween, seoulToday } from "../civil-date.js";
 
 export async function getDb() {
   const { env } = await import("cloudflare:workers");
@@ -91,6 +76,8 @@ type UserPatch = {
   muscleCoreKg?: number;
   muscleLowerLeftKg?: number;
   muscleLowerRightKg?: number;
+  ecwRatio?: number | null;
+  visceralFatLevel?: number | null;
   heightCm?: number;
   sex?: (typeof schema.sexes)[number];
   goalKcal?: number;
@@ -258,43 +245,59 @@ export async function saveInbody(
     muscleCoreKg: number;
     muscleLowerLeftKg: number;
     muscleLowerRightKg: number;
+    ecwRatio?: number;
+    visceralFatLevel?: number;
     heightCm?: number;
     sex?: (typeof schema.sexes)[number];
   },
 ) {
   const db = await getDb();
   const now = new Date().toISOString();
+  const readingPatch = {
+    weightKg: reading.weightKg,
+    skeletalMuscleKg: reading.skeletalMuscleKg,
+    bodyFatKg: reading.bodyFatKg,
+    bodyFatPercent: reading.bodyFatPercent,
+    muscleUpperLeftKg: reading.muscleUpperLeftKg,
+    muscleUpperRightKg: reading.muscleUpperRightKg,
+    muscleCoreKg: reading.muscleCoreKg,
+    muscleLowerLeftKg: reading.muscleLowerLeftKg,
+    muscleLowerRightKg: reading.muscleLowerRightKg,
+    ...(reading.ecwRatio != null ? { ecwRatio: reading.ecwRatio } : {}),
+    ...(reading.visceralFatLevel != null
+      ? { visceralFatLevel: reading.visceralFatLevel }
+      : {}),
+  };
   await db
     .insert(schema.inbodyReadings)
     .values({
       userId,
       measuredOn: reading.inbodyMeasuredOn,
-      weightKg: reading.weightKg,
-      skeletalMuscleKg: reading.skeletalMuscleKg,
-      bodyFatKg: reading.bodyFatKg,
-      bodyFatPercent: reading.bodyFatPercent,
-      muscleUpperLeftKg: reading.muscleUpperLeftKg,
-      muscleUpperRightKg: reading.muscleUpperRightKg,
-      muscleCoreKg: reading.muscleCoreKg,
-      muscleLowerLeftKg: reading.muscleLowerLeftKg,
-      muscleLowerRightKg: reading.muscleLowerRightKg,
+      ...readingPatch,
       createdAt: now,
     })
     .onConflictDoUpdate({
       target: [schema.inbodyReadings.userId, schema.inbodyReadings.measuredOn],
-      set: {
-        weightKg: reading.weightKg,
-        skeletalMuscleKg: reading.skeletalMuscleKg,
-        bodyFatKg: reading.bodyFatKg,
-        bodyFatPercent: reading.bodyFatPercent,
-        muscleUpperLeftKg: reading.muscleUpperLeftKg,
-        muscleUpperRightKg: reading.muscleUpperRightKg,
-        muscleCoreKg: reading.muscleCoreKg,
-        muscleLowerLeftKg: reading.muscleLowerLeftKg,
-        muscleLowerRightKg: reading.muscleLowerRightKg,
-      },
+      set: readingPatch,
     });
-  const updatedAt = await saveUser(userId, reading);
+  const updatedAt = await saveUser(userId, {
+    inbodyMeasuredOn: reading.inbodyMeasuredOn,
+    weightKg: reading.weightKg,
+    skeletalMuscleKg: reading.skeletalMuscleKg,
+    bodyFatKg: reading.bodyFatKg,
+    bodyFatPercent: reading.bodyFatPercent,
+    muscleUpperLeftKg: reading.muscleUpperLeftKg,
+    muscleUpperRightKg: reading.muscleUpperRightKg,
+    muscleCoreKg: reading.muscleCoreKg,
+    muscleLowerLeftKg: reading.muscleLowerLeftKg,
+    muscleLowerRightKg: reading.muscleLowerRightKg,
+    ...(reading.ecwRatio != null ? { ecwRatio: reading.ecwRatio } : {}),
+    ...(reading.visceralFatLevel != null
+      ? { visceralFatLevel: reading.visceralFatLevel }
+      : {}),
+    ...(reading.heightCm != null ? { heightCm: reading.heightCm } : {}),
+    ...(reading.sex != null ? { sex: reading.sex } : {}),
+  });
   return { ...reading, updatedAt };
 }
 
@@ -587,43 +590,6 @@ export async function getPendingWorkoutBurn(userId: string) {
     .select()
     .from(schema.pendingWorkoutBurns)
     .where(eq(schema.pendingWorkoutBurns.userId, userId))
-    .limit(1);
-  return rows[0] ?? null;
-}
-
-export async function upsertPendingMealPortions(
-  userId: string,
-  row: { note: string; foodsJson: string; palmComparison: string },
-) {
-  const db = await getDb();
-  const updatedAt = new Date().toISOString();
-  const values = {
-    userId,
-    note: row.note,
-    foodsJson: row.foodsJson,
-    palmComparison: row.palmComparison,
-    updatedAt,
-  };
-  await db
-    .insert(schema.pendingMealPortions)
-    .values(values)
-    .onConflictDoUpdate({
-      target: schema.pendingMealPortions.userId,
-      set: {
-        note: values.note,
-        foodsJson: values.foodsJson,
-        palmComparison: values.palmComparison,
-        updatedAt: values.updatedAt,
-      },
-    });
-}
-
-export async function getPendingMealPortions(userId: string) {
-  const db = await getDb();
-  const rows = await db
-    .select()
-    .from(schema.pendingMealPortions)
-    .where(eq(schema.pendingMealPortions.userId, userId))
     .limit(1);
   return rows[0] ?? null;
 }

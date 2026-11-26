@@ -19,8 +19,9 @@ import {
 import { useUser } from "skybridge/web";
 import { useToolInfo } from "@/helpers.js";
 import { AffiliateCarousel } from "./components/affiliate-carousel.js";
+import { ChatNextHint } from "./components/chat-next-hint.js";
 import { SourceFooter } from "./components/source-footer.js";
-import { useAssistantContext } from "./use-assistant-context.js";
+import { useAssistantContext } from "../hooks/use-assistant-context.js";
 
 const visuals = ["bar", "line", "area"] as const;
 const visualLabel = { bar: "막대", line: "꺾은선", area: "영역" } as const;
@@ -304,6 +305,7 @@ export function DietChartPanel({
         }
         libs={["recharts"]}
       />
+      <ChatNextHint example="성실도 달력 보여줘" />
     </div>
   );
 }

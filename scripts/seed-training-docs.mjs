@@ -29,24 +29,15 @@ const docs = [
     r2Key: "docs/training/daily-kcal.docx",
   },
   {
-    id: "exercise-selection",
-    topic: "exercise_selection",
-    title: "과학적 1일 운동 종목·부위 설정",
+    id: "workout-course",
+    topic: "workout_course",
+    title: "인바디 기반 맞춤형 운동 코스 통합 처방 가이드",
     summary:
-      "주간 분할(무분할·2분할·3분할), 단일 세션 6~10세트 상한, 분수 볼륨 0.5, 배치 순서·이완 구간 종목 조합.",
-    md: "과학적 1일 운동 종목·부위 설정.md",
-    docx: "과학적 1일 운동 종목·부위 설정.docx",
-    r2Key: "docs/training/exercise-selection.docx",
-  },
-  {
-    id: "inbody-1rm",
-    topic: "inbody_1rm",
-    title: "인바디 운동 처방 및 1RM 근거",
-    summary:
-      "인바디 기반 Phase·타이머·부상 대체, Mayhew/Wathen/Brzycki 1RM, RIR±4% 보정, Priority Principle.",
-    md: "인바디 운동 처방 및 1RM 근거.md",
-    docx: "인바디 운동 처방 및 1RM 근거.docx",
-    r2Key: "docs/training/inbody-1rm.docx",
+      "운동 코스 Single Source of Truth. ECW·VFL·비대칭·코어 후배치·가용 일수 분할·rest_timer 기본·조건부 AMRAP/EMOM·1RM/RIR·부상 대체.",
+    md: "인바디 기반 맞춤형 운동 코스 통합 처방 가이드.md",
+    /** Markdown-only; R2 stores .md (no .docx required). */
+    docx: null,
+    r2Key: "docs/training/workout-course.md",
   },
 ];
 
@@ -81,8 +72,9 @@ function chunkText(text, maxLen = 900) {
     const maybeHeading =
       para.length < 100 &&
       (/^\d+(\.\d+)*[.\s]/.test(para) ||
-        /^(원칙|가드레일|템플릿|워너비|공식|근거|공식명)/.test(para));
-    if (maybeHeading) heading = para.slice(0, 120);
+        /^#{1,3}\s/.test(para) ||
+        /^(원칙|가드레일|템플릿|워너비|공식|근거|공식명|Phase|ECW|VFL)/.test(para));
+    if (maybeHeading) heading = para.replace(/^#+\s*/, "").slice(0, 120);
 
     if (buf.length + para.length + 1 > maxLen && buf.length > 120) {
       flush();
@@ -120,8 +112,9 @@ function buildSql() {
     }
     const text = cleanText(fs.readFileSync(mdPath, "utf8"));
     const chunks = chunkText(text);
+    const sourceFile = doc.docx ?? doc.md;
     lines.push(
-      `INSERT INTO training_docs (id, title, topic, summary, r2_key, source_file, updated_at) VALUES (${sqlString(doc.id)}, ${sqlString(doc.title)}, ${sqlString(doc.topic)}, ${sqlString(doc.summary)}, ${sqlString(doc.r2Key)}, ${sqlString(doc.docx)}, ${sqlString(now)});`,
+      `INSERT INTO training_docs (id, title, topic, summary, r2_key, source_file, updated_at) VALUES (${sqlString(doc.id)}, ${sqlString(doc.title)}, ${sqlString(doc.topic)}, ${sqlString(doc.summary)}, ${sqlString(doc.r2Key)}, ${sqlString(sourceFile)}, ${sqlString(now)});`,
     );
     chunks.forEach((chunk, i) => {
       lines.push(
@@ -161,25 +154,13 @@ if (args.has("--upload-r2")) {
   const tmp = path.join(root, "scripts", ".tmp-training-docs");
   fs.mkdirSync(tmp, { recursive: true });
   for (const doc of docs) {
-    const file = path.join(docsDir, doc.docx);
-    if (!fs.existsSync(file)) throw new Error(`Missing docx: ${file}`);
-    const asciiDocx = path.join(tmp, `${doc.id}.docx`);
+    const mdSrc = path.join(docsDir, doc.md);
     const asciiMd = path.join(tmp, `${doc.id}.md`);
-    fs.copyFileSync(file, asciiDocx);
-    fs.copyFileSync(path.join(docsDir, doc.md), asciiMd);
-    console.log(`R2 put ${doc.r2Key}`);
-    wrangler([
-      "r2",
-      "object",
-      "put",
-      `${bucket}/${doc.r2Key}`,
-      "--remote",
-      "--file",
-      asciiDocx,
-      "--content-type",
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ]);
-    const mdKey = doc.r2Key.replace(/\.docx$/i, ".md");
+    fs.copyFileSync(mdSrc, asciiMd);
+    const mdKey = doc.r2Key.endsWith(".md")
+      ? doc.r2Key
+      : doc.r2Key.replace(/\.docx$/i, ".md");
+    console.log(`R2 put ${mdKey}`);
     wrangler([
       "r2",
       "object",
@@ -191,6 +172,24 @@ if (args.has("--upload-r2")) {
       "--content-type",
       "text/markdown; charset=utf-8",
     ]);
+    if (doc.docx) {
+      const file = path.join(docsDir, doc.docx);
+      if (!fs.existsSync(file)) throw new Error(`Missing docx: ${file}`);
+      const asciiDocx = path.join(tmp, `${doc.id}.docx`);
+      fs.copyFileSync(file, asciiDocx);
+      console.log(`R2 put ${doc.r2Key}`);
+      wrangler([
+        "r2",
+        "object",
+        "put",
+        `${bucket}/${doc.r2Key}`,
+        "--remote",
+        "--file",
+        asciiDocx,
+        "--content-type",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      ]);
+    }
   }
 }
 

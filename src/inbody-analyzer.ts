@@ -466,6 +466,7 @@ function buildPrescription(input: {
   isImbalanced: boolean;
   goalId: TargetBodyType | null | undefined;
   recoverOnly: boolean;
+  ecwDeload?: boolean;
   avoidHiit: boolean;
 }): SessionPrescription {
   if (input.recoverOnly) {
@@ -480,10 +481,26 @@ function buildPrescription(input: {
       limitSec: 0,
       roundSec: 0,
       intensityFactor: 0.35,
-      bandLabel: "회복·저강도 (ECW 위험)",
+      bandLabel: "회복·저강도 (ECW>0.400 · 진료 권고)",
+    };
+  }
+  if (input.ecwDeload) {
+    return {
+      mode: "rest_timer",
+      sets: 2,
+      reps: 12,
+      targetRir: 3,
+      pct1RmMin: 40,
+      pct1RmMax: 55,
+      restSec: 120,
+      limitSec: 0,
+      roundSec: 60,
+      intensityFactor: 0.5,
+      bandLabel: "ECW 디로딩 · 볼륨 40~50% · AMRAP/EMOM 유예",
     };
   }
   if (input.isImbalanced || input.phase === 1) {
+    // Doc §2.1 & §3.2: Asymmetry ≥10% forces rest_timer. Phase 1 defaults rest_timer.
     return {
       mode: "rest_timer",
       sets: 3,
@@ -499,33 +516,19 @@ function buildPrescription(input: {
     };
   }
   if (input.avoidHiit || (input.shape === "C" && input.phase <= 2)) {
-    if (input.avoidHiit) {
-      return {
-        mode: "rest_timer",
-        sets: 3,
-        reps: 14,
-        targetRir: 3,
-        pct1RmMin: 40,
-        pct1RmMax: 55,
-        restSec: 90,
-        limitSec: 0,
-        roundSec: 60,
-        intensityFactor: 0.45,
-        bandLabel: "내장지방 보호 · LISS+기초 저항 (HIIT 유예)",
-      };
-    }
+    // VFL≥10 or C-shape: default rest_timer, AMRAP only as conditional option per doc §3.2
     return {
-      mode: "amrap",
-      sets: 0,
+      mode: "rest_timer",
+      sets: 3,
       reps: 14,
-      targetRir: 2,
+      targetRir: 3,
       pct1RmMin: 40,
-      pct1RmMax: 60,
-      restSec: 0,
-      limitSec: 12 * 60,
-      roundSec: 0,
-      intensityFactor: 0.5,
-      bandLabel: "커팅 40~60%1RM · 12~15회 · AMRAP 12분 순환",
+      pct1RmMax: 55,
+      restSec: 90,
+      limitSec: 0,
+      roundSec: 60,
+      intensityFactor: 0.45,
+      bandLabel: "내장지방 보호 · LISS+기초 저항 (HIIT 유예)",
     };
   }
   if (input.goalId === "power" && input.phase === 3) {
@@ -544,38 +547,34 @@ function buildPrescription(input: {
     };
   }
   if (input.shape === "D" || input.phase === 3) {
-    const isolationRest = input.goalId === "upper" || input.goalId === "lower";
+    // I-shape defaults to rest_timer per doc §3.2 (not EMOM). D-shape uses rest_timer.
     return {
-      mode:
-        input.shape === "I" && input.phase === 2
-          ? "emom"
-          : input.goalId === "slim"
-            ? "emom"
-            : "rest_timer",
+      mode: "rest_timer",
       sets: 4,
       reps: 10,
       targetRir: 2,
       pct1RmMin: 60,
       pct1RmMax: 80,
-      restSec: isolationRest ? 90 : 150,
-      limitSec: input.goalId === "slim" || input.shape === "I" ? 12 * 60 : 0,
+      restSec: 150,
+      limitSec: 0,
       roundSec: 60,
       intensityFactor: 0.7,
       bandLabel: "근비대 60~80%1RM · 8~12회 @ RIR 1~2",
     };
   }
+  // I-shape / default: rest_timer (doc §3.2 — not EMOM).
   return {
-    mode: "emom",
-    sets: 12,
+    mode: "rest_timer",
+    sets: 3,
     reps: 10,
     targetRir: 2,
     pct1RmMin: 60,
     pct1RmMax: 75,
-    restSec: 0,
-    limitSec: 12 * 60,
+    restSec: 150,
+    limitSec: 0,
     roundSec: 60,
     intensityFactor: 0.68,
-    bandLabel: "베이스 60~75%1RM · EMOM",
+    bandLabel: "베이스 60~75%1RM · rest_timer",
   };
 }
 
@@ -764,15 +763,22 @@ export function analyzeInbodyWorkout(
   const shape: BodyShape = cid?.shape ?? "I";
   const weak = weakRegions(input);
   const goal = findBodyGoal(opts.targetBodyType);
+  // D-shape Phase eligibility: use signed/directional gap, not absolute value.
+  // Muscle surplus + fat deficit = achieved (muscle>100% AND fat<100% = Phase 3 eligible).
+  // Doc §7.1: prevent D-type from being demoted to Phase 2 due to abs value.
+  const musclePercent = cid?.rows[1]?.percent ?? 100;
+  const fatPercent = cid?.rows[2]?.percent ?? 100;
   const compositionGap =
     cid !== null &&
-    (Math.abs((cid.rows[1]?.percent ?? 100) - 100) > 12 ||
-      Math.abs((cid.rows[2]?.percent ?? 100) - 100) > 12);
+    !((musclePercent > 112 && fatPercent < 88) || // D-shape achieved
+      (musclePercent > 100 && fatPercent < 100)); // Both in favorable direction
 
   const ecw = input.ecwRatio ?? null;
   const vfl = input.visceralFatLevel ?? null;
-  const recoverOnly = ecw != null && ecw > 0.39;
-  const ecwCaution = ecw != null && ecw > 0.38 && ecw <= 0.39;
+  /** Doc §1.1: ≤0.390 normal; 0.390–0.400 deload; >0.400 recovery-only. */
+  const ecwCaution = ecw != null && ecw > 0.385 && ecw <= 0.39;
+  const ecwDeload = ecw != null && ecw > 0.39 && ecw <= 0.4;
+  const recoverOnly = ecw != null && ecw > 0.4;
   const avoidHiit = shape === "C" && vfl != null && vfl >= 10;
 
   let phase: WorkoutPhase;
@@ -838,6 +844,7 @@ export function analyzeInbodyWorkout(
     isImbalanced,
     goalId: goal?.id,
     recoverOnly,
+    ecwDeload,
     avoidHiit,
   });
 
@@ -873,7 +880,7 @@ export function analyzeInbodyWorkout(
       ? `불편 부위(${injured.map((p) => injuredPartLabel[p]).join(", ")})를 자극하는 종목은 빼고, 같은 목표 근육을 안전한 궤적으로 대체했습니다.`
       : undefined;
 
-  const exercises: PlannedExercise[] = [
+  let exercises: PlannedExercise[] = [
     ...(compoundCircuit
       ? []
       : required.map((item) =>
@@ -907,6 +914,59 @@ export function analyzeInbodyWorkout(
       }),
     ),
   ];
+
+  // Doc §8.1 & §3.1: Phase 1 session cap 4–6 exercises / 12–18 total sets (replace, not append).
+  // Core always last. Count: core = 1, non-core = 1, except isolation cooperates count is 0.5.
+  if (phase === 1 && !compoundCircuit) {
+    const countSets = (items: PlannedExercise[]) => {
+      let total = 0;
+      for (const item of items) {
+        if (item.region === "core") {
+          // Core is 0.5-counted in total set volume calc per doc.
+          total += item.sets * 0.5;
+        } else {
+          total += item.sets;
+        }
+      }
+      return total;
+    };
+    
+    // Separate core from non-core; keep up to 6 non-core exercises / ~18 total sets.
+    const coreExercises = exercises.filter((e) => e.region === "core");
+    const nonCoreExercises = exercises.filter((e) => e.region !== "core");
+    
+    // Cull non-core to fit 4–6 exercises, prioritizing required (structural fixes).
+    let trimmed = nonCoreExercises;
+    if (nonCoreExercises.length > 6) {
+      const required_nc = nonCoreExercises.filter((e) => e.required);
+      const optional_nc = nonCoreExercises.filter((e) => !e.required);
+      // Keep all required + as many optional as fit within 6 total.
+      trimmed = [
+        ...required_nc,
+        ...optional_nc.slice(0, Math.max(0, 6 - required_nc.length)),
+      ];
+    }
+    
+    // Adjust sets if still over 18 total (prioritize required again).
+    while (countSets([...trimmed, ...coreExercises]) > 18 && trimmed.length > 0) {
+      const optionalIdx = trimmed.findIndex((e) => !e.required);
+      if (optionalIdx >= 0) {
+        trimmed.splice(optionalIdx, 1);
+      } else {
+        // All remaining are required; reduce their sets by 1.
+        const idx = trimmed.length - 1;
+        if (trimmed[idx]!.sets > 1) {
+          trimmed[idx]!.sets -= 1;
+        } else {
+          trimmed.splice(idx, 1);
+        }
+      }
+    }
+    
+    // Core always last.
+    exercises = [...trimmed, ...coreExercises];
+  }
+
   if (amrapCircuit) {
     for (const item of exercises) {
       item.why = `${item.why} AMRAP 전신 순환 코스(다관절 3개·맨몸/가벼운 무게·중고반복·12분)로 묶었습니다.`;
@@ -1016,11 +1076,15 @@ export function analyzeInbodyWorkout(
   }
   if (recoverOnly) {
     safetyNotes.push(
-      `세포외수분비(ECW/TBW) ${ecw}가 0.390을 넘어 고강도·고중량을 유예하고 회복·스트레칭을 우선합니다. 전문의 상담을 권합니다.`,
+      `세포외수분비(ECW/TBW) ${ecw}가 0.400을 넘어 저강도 회복·가동성만 허용합니다. 의료 전문가 진료를 권합니다.`,
+    );
+  } else if (ecwDeload) {
+    safetyNotes.push(
+      `ECW/TBW ${ecw}는 0.390~0.400 디로딩 구간이라 AMRAP/EMOM·고중량을 유예하고 볼륨을 40~50%로 줄였습니다.`,
     );
   } else if (ecwCaution) {
     safetyNotes.push(
-      `ECW/TBW ${ecw}는 경계 구간(0.380~0.390)이라 볼륨을 보수적으로 잡았습니다. 공복 2~4시간·직전 고강도 운동이 있으면 체수분 왜곡일 수 있습니다.`,
+      `ECW/TBW ${ecw}는 정상 상단(0.385~0.390)이라 수면·수분·회복을 점검하세요. 공복 2~4시간·직전 고강도면 체수분 왜곡일 수 있습니다.`,
     );
   }
   if (avoidHiit) {

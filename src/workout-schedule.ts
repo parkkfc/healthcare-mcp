@@ -248,6 +248,7 @@ export function slotByRole(role: string): SlotDef | undefined {
   return SLOTS[role];
 }
 
+// Doc §2.2: Core isolation always last in exercise order (absolute post-ordering rule).
 const TEMPLATES: Record<SessionKind, string[]> = {
   full: [
     "squat",
@@ -256,6 +257,7 @@ const TEMPLATES: Record<SessionKind, string[]> = {
     "leg_curl",
     "lateral_raise",
     "triceps",
+    "core",
   ],
   upper: [
     "chest_press",
@@ -264,6 +266,7 @@ const TEMPLATES: Record<SessionKind, string[]> = {
     "vertical_pull",
     "lateral_raise",
     "triceps",
+    "core",
   ],
   lower: ["squat", "hinge", "leg_extension", "leg_curl", "calf", "core"],
   push: [
@@ -273,6 +276,7 @@ const TEMPLATES: Record<SessionKind, string[]> = {
     "shoulder_press",
     "lateral_raise",
     "triceps",
+    "core",
   ],
   pull: ["vertical_pull", "row", "rear_delt", "curl", "core"],
   legs: [
@@ -325,7 +329,7 @@ export function buildWeekCalendar(input: {
   phase: 1 | 2 | 3;
   bias: ScheduleBias;
 }): WeekDaySlot[] {
-  const { days } = weekFor(input.phase, input.bias);
+  const { days } = weekFor(input.phase);
   const train = new Set<number>();
   if (input.phase <= 1) {
     // 월·수·금
@@ -373,25 +377,8 @@ export function dateInSameWeek(baseDate: string, weekday: number): string {
   return `${yy}-${mm}-${dd}`;
 }
 
-/** Sun=0 … Sat=6. Upper-weak weeks keep one leg day so legs are not dropped. */
-const UPPER_WEEK: SessionKind[] = [
-  "pull",
-  "push",
-  "pull",
-  "legs",
-  "push",
-  "pull",
-  "push",
-];
-const LOWER_WEEK: SessionKind[] = [
-  "push",
-  "legs",
-  "legs",
-  "pull",
-  "legs",
-  "legs",
-  "push",
-];
+// Doc §4.1: Remove UPPER_WEEK/LOWER_WEEK 4-day skew templates.
+// Keep balanced splits: Phase 1 = full-body, Phase 2 = 2-split (UL), Phase 3 = 3-split (PPL).
 const FULL_WEEK: SessionKind[] = [
   "lower",
   "full",
@@ -524,16 +511,12 @@ export function inferRecentKind(names: string[]): SessionKind | null {
   return null;
 }
 
-function weekFor(phase: 1 | 2 | 3, bias: ScheduleBias): {
+function weekFor(phase: 1 | 2 | 3): {
   days: SessionKind[];
   splitLabel: string;
 } {
-  if (bias === "upper") {
-    return { days: UPPER_WEEK, splitLabel: "상체 중심 주간" };
-  }
-  if (bias === "lower") {
-    return { days: LOWER_WEEK, splitLabel: "하체 중심 주간" };
-  }
+  // Doc §4.1: Removed UPPER_WEEK/LOWER_WEEK 4-day skew templates. Keep balanced splits.
+  // Weak region gets priority placement + set bias only, never 4 consecutive same-region days.
   if (phase <= 1) return { days: FULL_WEEK, splitLabel: "무분할" };
   if (phase === 2) return { days: UL_WEEK, splitLabel: "2분할" };
   return { days: PPL_WEEK, splitLabel: "3분할" };
@@ -558,7 +541,7 @@ export function assignTodaySession(input: {
 }): TodaySession {
   const weekday = weekdayIndex(input.date);
   const balance = scheduleBias(input);
-  const { days, splitLabel } = weekFor(input.phase, balance.bias);
+  const { days, splitLabel } = weekFor(input.phase);
   const yesterday = inferRecentKind(input.recentExerciseNames ?? []);
   let index = weekday;
   let kind = days[index] ?? "full";
@@ -677,6 +660,8 @@ export function fillSessionSlots(input: {
   const used = new Set(input.usedSlugs ?? []);
   const filled: FilledSlot[] = [];
   const missing: MissingSlot[] = [];
+  // Doc §2.1: asymmetry → keep bilateral compounds + force 1–2 unilateral slots.
+  let unilateralSlotsLeft = input.preferUnilateral && !compound ? 2 : 0;
   for (const slot of ordered) {
     const hits = input.catalog
       .filter((item) => {
@@ -689,7 +674,18 @@ export function fillSessionSlots(input: {
           rankHit(b, input.preferUnilateral, compound) -
           rankHit(a, input.preferUnilateral, compound),
       );
-    const picked = hits[0];
+    let picked = hits[0];
+    if (
+      unilateralSlotsLeft > 0 &&
+      slot.region !== "core" &&
+      hits.length > 0
+    ) {
+      const uni = hits.find((item) => item.laterality === "unilateral");
+      if (uni) {
+        picked = uni;
+        unilateralSlotsLeft -= 1;
+      }
+    }
     if (!picked) {
       missing.push({
         role: slot.id,
